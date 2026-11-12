@@ -158,6 +158,22 @@ test("sign-in: Priya sees both repos; Sam only sees the one he can read on GitHu
   assert.ok(!tok.startsWith("ghu_"), "user tokens are stored encrypted");
 });
 
+test("a repo added to the installation after sign-in shows up at once, not after the hourly check", async () => {
+  gh.addRepo("acme/late", readDir(SAMPLE), { id: 503 });
+  gh.installations.get(77).repos.add("acme/late");
+  gh.users.get("priya").access[77].push("acme/late");
+  const res = await webhook("installation_repositories", { action: "added", installation: { id: 77, account: { login: "acme" } } });
+  assert.equal(res.status, 202);
+  await app.idle();
+  assert.ok((await get("/api/repos", "priya")).body.some((r) => r.name === "acme/late"));
+  assert.ok(!(await get("/api/repos", "sam")).body.some((r) => r.name === "acme/late"), "Sam still cannot read it");
+  // Put things back for the tests that follow.
+  gh.installations.get(77).repos.delete("acme/late");
+  gh.users.get("priya").access[77] = gh.users.get("priya").access[77].filter((n) => n !== "acme/late");
+  await webhook("installation_repositories", { action: "removed", installation: { id: 77, account: { login: "acme" } } });
+  await app.idle();
+});
+
 test("a bad sign-in state is refused", async () => {
   const cb = await get(`/auth/github/callback?code=${gh.authorize("priya")}&state=forged`);
   assert.equal(cb.headers.get("location"), "/#/signin?error=state");

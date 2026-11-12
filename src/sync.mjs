@@ -146,8 +146,10 @@ async function backfill(ctx, connectionId) {
   if (!client) throw new Error("GitHub is not set up");
   const repos = await client.installationRepos(conn.external_id);
   const ids = new Set(repos.map((r) => String(r.id)));
+  let added = 0;
   tx(db, () => {
     for (const r of repos) {
+      if (!db.prepare("SELECT 1 FROM repos WHERE connection_id = ? AND platform_repo_id = ?").get(connectionId, String(r.id))) added += 1;
       db.prepare(`INSERT INTO repos (connection_id, platform_repo_id, full_name, default_branch, web_url) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT (connection_id, platform_repo_id) DO UPDATE SET full_name = excluded.full_name, default_branch = excluded.default_branch, web_url = excluded.web_url`)
         .run(connectionId, String(r.id), r.full_name, r.default_branch, r.html_url);
@@ -160,6 +162,9 @@ async function backfill(ctx, connectionId) {
       if (!ids.has(row.platform_repo_id)) db.prepare("DELETE FROM repos WHERE id = ?").run(row.id);
     }
     pruneBlobs(db);
+    // Sign-ins remember which repos each person can read; re-check them on their next request
+    // so a newly added repo shows up at once rather than at the hourly check.
+    if (added) db.prepare("UPDATE sessions SET github_checked_at = NULL WHERE github_token_enc IS NOT NULL").run();
   });
   for (const b of db.prepare(`SELECT b.id FROM branches b JOIN repos r ON r.id = b.repo_id
     WHERE r.connection_id = ? AND b.tracked = 1 AND r.tracked = 1`).all(connectionId)) enqueue(db, b.id, "backfill");
@@ -179,6 +184,7 @@ export function addGitlabProject(db, connectionId, project) {
     const repoId = db.prepare("SELECT id FROM repos WHERE connection_id = ? AND platform_repo_id = ?").get(connectionId, String(project.id)).id;
     let branch = db.prepare("SELECT id FROM branches WHERE repo_id = ? ORDER BY id LIMIT 1").get(repoId);
     if (!branch) branch = { id: Number(db.prepare("INSERT INTO branches (repo_id, name) VALUES (?, ?)").run(repoId, project.default_branch).lastInsertRowid) };
+    if (!existing) db.prepare("UPDATE sessions SET gitlab_checked_at = NULL WHERE gitlab_token_enc IS NOT NULL").run(); // others may read it too
     return { repoId, branchId: branch.id, created: !existing };
   });
 }
