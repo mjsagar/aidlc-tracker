@@ -74,6 +74,10 @@ after(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("an https tracker sends HSTS", async () => {
+  assert.equal((await get("/")).headers.get("strict-transport-security"), "max-age=31536000");
+});
+
 test("setup refuses bad tokens and stores the good one encrypted", async () => {
   const me0 = (await get("/api/me")).body;
   assert.deepEqual([me0.gitlab.configured, me0.gitlab.canSetUp, me0.gitlab.redirectUri], [false, true, `${PUBLIC}/auth/gitlab/callback`]);

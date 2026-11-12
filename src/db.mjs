@@ -229,6 +229,11 @@ const MIGRATIONS = [
   DROP TABLE sessions;
   ALTER TABLE sessions_v3 RENAME TO sessions;
   `,
+  // 3 -> 4: record whether each sync found a change, to count pushes the webhooks missed
+  `
+  ALTER TABLE sync_jobs ADD COLUMN changed INTEGER;
+  CREATE INDEX jobs_finished ON sync_jobs (finished_at);
+  `,
 ];
 
 export function openDb(path) {

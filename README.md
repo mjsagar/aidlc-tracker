@@ -4,7 +4,7 @@ Tracks AI-DLC work across repos: unanswered questions, stages waiting for approv
 
 Design: [AI-DLC Tracker: design](https://claude.ai/artifact/8Ws41qUugWrYiNkkC6DGT5).
 
-**Status:** milestone 4 of 5 (GitLab). Reads local checkouts, GitHub repos and gitlab.com projects. Checked against AI-DLC 2.11.3.
+**Status:** milestone 5 of 5 (deploy). Reads local checkouts, GitHub repos and gitlab.com projects; runs on Railway. Checked against AI-DLC 2.11.3.
 
 ## Run the tracker
 
@@ -50,20 +50,46 @@ Per repo you can track more branches on the Connections screen. Only files under
 | `POLL_SECONDS` | `30` | How often local folders are read again; `0` turns it off |
 | `ALLOW_LOCAL_REPOS` | `1` on loopback, else `0` | Whether the Connections screen may add local folders |
 | `PUBLIC_URL` | `http://127.0.0.1:PORT` | Address people and GitHub use; webhooks are switched on when it is not localhost |
-| `GITHUB_POLL_SECONDS` | `30` | How often tracked GitHub branches are checked; `0` turns it off |
+| `GITHUB_POLL_SECONDS` | `30`, or `300` when webhooks are on | How often tracked GitHub branches are checked; `0` turns it off |
 | `GITLAB_POLL_SECONDS` | `30` | How often tracked GitLab branches are checked; `0` turns it off |
 | `TRACKER_SECRET_KEY` | generated into `secret.key` beside the database | 32 bytes, base64; encrypts stored GitHub credentials and sign-in tokens |
-| `SETUP_TOKEN` | none | Allows GitHub set-up from another computer |
+| `SETUP_TOKEN` | none | Allows GitHub and GitLab set-up from another computer (entered on the Connections screen). When the server listens beyond loopback, this is the only way |
 
 Screens: **Inbox** (everything waiting on a person, oldest first, filtered by who answers, phase, repo and age), **Work** (one row per piece of work, sorted by most blocked), a page per piece of work (lifecycle spine, open and answered questions, approvals, agent notes, timeline, file problems), and **Connections**.
 
 The server reads a folder only when it is bound to loopback, unless `ALLOW_LOCAL_REPOS=1`. Write requests must be JSON, so another website cannot make a browser post to it.
 
+## Deploy (Railway)
+
+The repo builds with its `Dockerfile` (no npm install; the image holds only `server.mjs`, `src/`, `public/` and `bin/`). The container runs as the `node` user, listens on `0.0.0.0:3100`, and keeps the database in `/app/data`.
+
+```bash
+railway login
+railway init --name aidlc-tracker
+railway up --detach                                   # first build; creates the service
+railway volume add --mount-path /app/data             # the database must survive redeploys
+railway domain                                        # prints https://<name>.up.railway.app
+railway variables --set "PUBLIC_URL=https://<name>.up.railway.app" \
+  --set "SETUP_TOKEN=$(openssl rand -base64 24)" \
+  --set "TRACKER_SECRET_KEY=$(openssl rand -base64 32)" \
+  --set "RAILWAY_RUN_UID=0"
+railway up --detach                                   # redeploy with the settings
+BASE_URL=https://<name>.up.railway.app npm run smoke
+```
+
+- `RAILWAY_RUN_UID=0` is needed because Railway mounts volumes as root and the image runs as `node`.
+- Keep `TRACKER_SECRET_KEY` somewhere safe (a password manager). Stored GitHub and GitLab credentials and sign-in tokens are encrypted with it; without it, a copy of the database is useless, and so is the database itself if the key is lost.
+- `SETUP_TOKEN` is asked for on the Connections screen the first time you set up GitHub or GitLab on the deployed tracker. Remove the variable afterwards if you like.
+- Set up a **new** GitHub App from the deployed tracker. Its manifest then carries the public callback URLs and a push webhook. An app created on `localhost` has neither.
+- For GitLab, add a second OAuth application (or edit the redirect URI) with `https://<name>.up.railway.app/auth/gitlab/callback`.
+- Once webhooks are on, GitHub branches are polled only every 5 minutes as a backstop. `/api/health` reports, for the last 7 days, how many changes arrived by webhook and how many polling found first (a webhook that never came). `npm run smoke` prints both.
+- Run a single replica: the job queue and polling live in one process.
+
 ## API
 
 | Route | Returns |
 | --- | --- |
-| `GET /api/health` | Status, counts, last sync, parser version, GitHub rate limit left (no sign-in needed) |
+| `GET /api/health` | Status, counts, last sync, parser version, GitHub rate limit left, changes by webhook and by polling over 7 days (no sign-in needed) |
 | `GET /api/me` | Who is signed in, whether sign-in is required, GitHub set-up state |
 | `GET /api/repos` | Tracked repos with their branches, counts, last read, errors |
 | `POST /api/repos/:id/branches` `{name}`, `DELETE /api/repos/:id/branches/:branchId` | Track or stop tracking a branch (GitHub repos) |

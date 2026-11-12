@@ -37,7 +37,7 @@ const isLoopback = (addr) => ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(a
 export function createApp({
   dbPath = ":memory:", allowLocal = true, pollSeconds = 30, githubPollSeconds = 30, gitlabPollSeconds = 30, localRepos = [],
   publicUrl = "http://127.0.0.1:3100", setupToken = null, githubApiUrl = "https://api.github.com", githubWebUrl = "https://github.com",
-  gitlabUrl = "https://gitlab.com",
+  gitlabUrl = "https://gitlab.com", localSetup = true,
   secretKey, fetchImpl, log = () => {},
 } = {}) {
   const db = openDb(dbPath);
@@ -358,7 +358,9 @@ export function createApp({
   const refreshedSession = (req) => currentSession(ctx, req);
   const tx = (fn) => { db.exec("BEGIN IMMEDIATE"); try { const out = fn(); db.exec("COMMIT"); return out; } catch (err) { db.exec("ROLLBACK"); throw err; } };
 
-  const setupAllowed = (req) => isLoopback(req.socket.remoteAddress) || (setupToken && safeEqual(req.headers["x-setup-token"], setupToken));
+  // Set-up is allowed from this computer (only when the server listens on loopback, since behind a proxy every
+  // request can look local) or with the set-up token.
+  const setupAllowed = (req) => (localSetup && isLoopback(req.socket.remoteAddress)) || Boolean(setupToken && safeEqual(req.headers["x-setup-token"], setupToken));
 
   // ---------- HTTP
 
@@ -368,6 +370,7 @@ export function createApp({
     "X-Frame-Options": "DENY",
     "Content-Security-Policy": `default-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self'; form-action 'self' ${githubWebUrl}; frame-ancestors 'none'`,
   };
+  if (secureCookies) securityHeaders["Strict-Transport-Security"] = "max-age=31536000";
   const send = (res, status, body, headers = {}) => { res.writeHead(status, { ...securityHeaders, ...headers }); res.end(body); };
   const json = (res, status, obj, headers = {}) => send(res, status, JSON.stringify(obj), { "Content-Type": TYPES[".json"], "Cache-Control": "no-store", ...headers });
   const redirect = (res, location, headers = {}) => send(res, 302, null, { Location: location, "Cache-Control": "no-store", ...headers });
@@ -415,9 +418,18 @@ export function createApp({
       const counts = db.prepare(`SELECT (SELECT COUNT(*) FROM repos) AS repos, (SELECT COUNT(*) FROM intents) AS intents,
         (SELECT COUNT(*) FROM sync_jobs WHERE state = 'queued') AS queued, (SELECT MAX(last_synced_at) FROM branches) AS lastSync,
         (SELECT COUNT(*) FROM branches WHERE sync_error IS NOT NULL) AS syncErrors`).get();
+      // Over the last 7 days, by platform: changes that arrived by webhook, and changes polling found first.
+      // With webhooks on, a change found by polling is a push whose webhook never arrived (or arrived late).
+      const since = new Date(Date.now() - 7 * 864e5).toISOString();
+      const changes = db.prepare(`SELECT c.platform, j.reason, COUNT(*) AS n FROM sync_jobs j JOIN branches b ON b.id = j.branch_id
+        JOIN repos r ON r.id = b.repo_id JOIN connections c ON c.id = r.connection_id
+        WHERE j.changed = 1 AND j.finished_at >= ? AND j.reason IN ('push', 'poll') GROUP BY c.platform, j.reason`).all(since);
+      const changesBy = (platform, reason) => changes.find((r) => r.platform === platform && r.reason === reason)?.n ?? 0;
       return json(res, 200, { status: "healthy", parserVersion: PARSER_VERSION, aidlcCheckedAgainst: AIDLC_CHECKED_AGAINST,
-        allowLocal, github: Boolean(appRow()), gitlab: Boolean(gitlabRow()), ...counts, githubRateRemaining: client?.rate.remaining ?? null,
-        uptime: Math.round((Date.now() - started) / 1000) });
+        allowLocal, github: Boolean(appRow()), gitlab: Boolean(gitlabRow()), webhooks: !publicIsLocal, ...counts,
+        last7Days: { github: { byWebhook: changesBy("github", "push"), byPolling: changesBy("github", "poll") },
+          gitlab: { byWebhook: changesBy("gitlab", "push"), byPolling: changesBy("gitlab", "poll") } },
+        githubRateRemaining: client?.rate.remaining ?? null, uptime: Math.round((Date.now() - started) / 1000) });
     }
 
     if (p === "/api/webhooks/github" && req.method === "POST") {

@@ -1,0 +1,9 @@
+.git
+.claude
+node_modules
+data
+test
+fixtures
+scripts
+*.log
+.DS_Store

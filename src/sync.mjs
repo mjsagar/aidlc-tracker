@@ -99,7 +99,11 @@ export function removeRepo(db, repoId) {
 /** Queues a sync unless one is already queued for that branch. Returns the job id. */
 export function enqueue(db, branchId, reason) {
   const queued = db.prepare("SELECT id FROM sync_jobs WHERE branch_id = ? AND state = 'queued'").get(branchId);
-  if (queued) return queued.id;
+  if (queued) {
+    // A webhook that lands on an already-queued poll still counts as delivered by webhook.
+    if (reason === "push") db.prepare("UPDATE sync_jobs SET reason = 'push' WHERE id = ?").run(queued.id);
+    return queued.id;
+  }
   return Number(db.prepare("INSERT INTO sync_jobs (branch_id, reason) VALUES (?, ?)").run(branchId, reason).lastInsertRowid);
 }
 
@@ -257,7 +261,7 @@ export async function runNextJob(ctx) {
   db.prepare("UPDATE sync_jobs SET state = 'running', attempts = attempts + 1 WHERE id = ?").run(job.id);
   try {
     const result = await syncBranch(ctx, job.branch_id, { force: job.reason === "resync" });
-    db.prepare("UPDATE sync_jobs SET state = 'done', finished_at = ? WHERE id = ?").run(nowIso(), job.id);
+    db.prepare("UPDATE sync_jobs SET state = 'done', finished_at = ?, changed = ? WHERE id = ?").run(nowIso(), result.changed ? 1 : 0, job.id);
     return { job: job.id, ...result };
   } catch (err) {
     if (err.retryAfter != null && job.attempts < 5) {

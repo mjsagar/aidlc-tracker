@@ -226,6 +226,21 @@ test("polling: an unchanged branch costs one free conditional request; a change 
   enqueueAll(app.db, "poll", { platform: "github" });
   await app.kick();
   assert.equal((await get("/api/questions?open=true", "priya")).body.length, 5);
+  const stats = (await get("/api/health")).body.last7Days.github;
+  assert.equal(stats.byWebhook, 1, "the earlier push arrived by webhook");
+  assert.equal(stats.byPolling, 1, "this change was found by polling, as a missed webhook would be");
+});
+
+test("a webhook landing on a queued poll still counts as delivered by webhook", async () => {
+  const shopBranch = app.db.prepare("SELECT b.id FROM branches b JOIN repos r ON r.id = b.repo_id WHERE r.full_name = 'acme/shop'").get().id;
+  enqueueAll(app.db, "poll", { platform: "github" });
+  const text = gh.getFile("acme/shop", "main", TODO_Q);
+  gh.setFile("acme/shop", "main", TODO_Q, text.replace("# Requirements Analysis Questions", "# Requirements Analysis Questions (edited)"));
+  await webhook("push", { ref: "refs/heads/main", after: "d".repeat(40), installation: { id: 77 }, repository: { id: 501 } });
+  await app.idle();
+  const job = app.db.prepare("SELECT reason, changed FROM sync_jobs WHERE branch_id = ? ORDER BY id DESC LIMIT 1").get(shopBranch);
+  assert.deepEqual([job.reason, job.changed], ["push", 1]);
+  assert.equal((await get("/api/health")).body.last7Days.github.byWebhook, 2);
 });
 
 test("rate limits defer the job instead of failing the branch", async () => {

@@ -9,8 +9,14 @@ const REFRESH_MS = 30_000;
 
 // ---------- helpers
 
+// The set-up token (SETUP_TOKEN on the server) lets GitHub and GitLab be set up on a tracker that is not on
+// this computer. It is kept for this tab only and sent as a header, never in a URL.
+let setupToken = null;
+try { setupToken = sessionStorage.getItem("aidlc-tracker:setup-token"); } catch { /* storage blocked */ }
+
 const api = async (path, opts = {}) => {
-  const res = await fetch(path, { ...opts, headers: { ...(opts.body ? { "Content-Type": "application/json" } : {}), ...opts.headers } });
+  const res = await fetch(path, { ...opts, headers: { ...(opts.body ? { "Content-Type": "application/json" } : {}),
+    ...(setupToken ? { "X-Setup-Token": setupToken } : {}), ...opts.headers } });
   const body = await res.json().catch(() => ({}));
   if (res.status === 401 && body.signIn) {
     if (!location.hash.startsWith("#/signin")) location.hash = "#/signin";
@@ -390,10 +396,7 @@ function githubSection() {
         el("a", { class: "btn primary", href: gh.installUrl, target: "_blank", rel: "noopener noreferrer" }, "Choose repos on GitHub"),
         check));
   }
-  if (!gh.canSetUp) {
-    return el("section", { class: "gh" }, el("h2", {}, "GitHub"),
-      el("p", { class: "muted" }, "GitHub is not set up. Set it up from the computer running the tracker."));
-  }
+  if (!gh.canSetUp) return setupTokenForm("GitHub");
   const org = el("input", { type: "text", name: "org", placeholder: "Leave empty for your own account", autocomplete: "off", spellcheck: "false" });
   const errorP = el("p", { class: "form-error", role: "alert", hidden: true });
   const btn = el("button", { type: "submit", class: "btn primary" }, "Set up GitHub");
@@ -420,7 +423,7 @@ function githubSection() {
 function gitlabSection(repos) {
   const gl = me.gitlab;
   if (!gl.configured) {
-    if (!gl.canSetUp) return el("section", { class: "gh" }, el("h2", {}, "GitLab"), el("p", { class: "muted" }, "GitLab is not set up. Set it up from the computer running the tracker."));
+    if (!gl.canSetUp) return setupTokenForm("GitLab");
     const id = el("input", { type: "text", name: "clientId", autocomplete: "off", spellcheck: "false", required: true });
     const secret = el("input", { type: "password", name: "clientSecret", autocomplete: "off", required: true });
     const token = el("input", { type: "password", name: "token", autocomplete: "off", required: true });
@@ -490,6 +493,29 @@ function gitlabSection(repos) {
       el("p", { class: "small" }, "Secret token ", el("code", {}, gl.webhook.secret))) : "",
     addBlock,
     el("details", {}, el("summary", {}, "Replace the access token"), replace));
+}
+
+function setupTokenForm(what = "GitHub or GitLab") {
+  const input = el("input", { type: "password", name: "setupToken", autocomplete: "off", required: true });
+  const errorP = el("p", { class: "form-error", role: "alert", hidden: true });
+  return el("section", { class: "gh" },
+    el("h2", {}, `Set up ${what}`),
+    el("p", {}, "This tracker is not running on this computer, so setting it up needs the set-up token its owner chose (", el("code", {}, "SETUP_TOKEN"), ")."),
+    el("form", { class: "add-form", onsubmit: async (e) => {
+      e.preventDefault();
+      setupToken = input.value;
+      try { sessionStorage.setItem("aidlc-tracker:setup-token", setupToken); } catch { /* kept in memory only */ }
+      await loadMe();
+      if (!(me.github.configured || me.github.canSetUp) || !(me.gitlab.configured || me.gitlab.canSetUp)) {
+        setupToken = null;
+        try { sessionStorage.removeItem("aidlc-tracker:setup-token"); } catch { /* nothing stored */ }
+        errorP.textContent = "That is not the set-up token.";
+        errorP.hidden = false;
+        return;
+      }
+      render();
+    } }, el("label", { class: "field" }, "Set-up token", input), el("button", { type: "submit", class: "btn primary" }, "Continue")),
+    errorP);
 }
 
 async function connectionsView({ params }) {
@@ -566,9 +592,9 @@ async function connectionsView({ params }) {
     el("h1", {}, "Connections"),
     el("p", { class: "lead" }, "Repos the tracker reads. It only reads the AI-DLC records under ", el("code", {}, "aidlc/"), " and never changes anything in a repo."),
     params.get("error") === "setup" ? el("p", { class: "form-error", role: "alert" }, "GitHub setup did not finish. Start it again.") : "",
-    githubSection(),
+    !me.github.configured && !me.gitlab.configured && !me.github.canSetUp ? setupTokenForm() : githubSection(),
     remote.length ? table(remote) : me.github.configured ? el("p", { class: "muted" }, "No GitHub repos yet. Choose repos on GitHub, then check GitHub.") : "",
-    gitlabSection(gitlabRepos),
+    !me.github.configured && !me.gitlab.configured && !me.github.canSetUp ? "" : gitlabSection(gitlabRepos),
     gitlabRepos.length ? table(gitlabRepos) : "",
     el("h2", {}, "Folders on this computer"),
     me.allowLocal ? form : el("p", { class: "muted" }, "Adding local folders is turned off on this server."),
