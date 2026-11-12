@@ -125,7 +125,14 @@ function parseIntent(space, folder, files) {
       const created = latest((e) => e.event === "ARTIFACT_CREATED" && typeof e.fields.File === "string" &&
         (e.fields.File === `${base}/${rel}` || e.fields.File.endsWith(`/${base}/${rel}`)));
       for (const q of parsed.questions) {
-        questions.push({ ...q, file: `${base}/${rel}`, ...where, openSince: q.open ? created?.timestamp ?? null : null });
+        // QUESTION_ANSWERED Details read "Q<n>: <choice>" (audit-format.md); a reply that
+        // answered several questions names each, so match the number anywhere at a word start.
+        const answered = !q.open && q.number !== null
+          ? latest((e) => e.event === "QUESTION_ANSWERED" && e.stage === where.stage &&
+            new RegExp(`(^|[\\s,;])Q${q.number}\\b`).test(e.fields.Details ?? ""))
+          : null;
+        questions.push({ ...q, file: `${base}/${rel}`, ...where, openSince: q.open ? created?.timestamp ?? null : null,
+          answeredAt: answered?.timestamp ?? null });
       }
     } else if (rel.endsWith("memory.md")) {
       const where = locate(rel);

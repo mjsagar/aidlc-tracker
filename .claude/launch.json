@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "tracker",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["--disable-warning=ExperimentalWarning", "server.mjs"],
+      "env": { "LOCAL_REPOS": "fixtures/repos/acme-shop", "DATABASE_PATH": "./data/dev.db", "PORT": "3100" },
+      "port": 3100
+    }
+  ]
+}

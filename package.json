@@ -11,7 +11,9 @@
     "aidlc-tracker": "bin/aidlc-tracker.mjs"
   },
   "scripts": {
-    "test": "node --test \"test/**/*.test.mjs\"",
+    "start": "node --disable-warning=ExperimentalWarning server.mjs",
+    "dev": "LOCAL_REPOS=fixtures/repos/acme-shop node --disable-warning=ExperimentalWarning --watch server.mjs",
+    "test": "node --disable-warning=ExperimentalWarning --test \"test/**/*.test.mjs\"",
     "inbox": "node bin/aidlc-tracker.mjs inbox fixtures/repos/acme-shop",
     "status": "node bin/aidlc-tracker.mjs status fixtures/repos/acme-shop"
   }
