@@ -350,8 +350,9 @@ async function intentView({ parts }) {
 
 // ---------- sign-in
 
-function signinView({ params }) {
+async function signinView({ params }) {
   setNav("");
+  await loadMe(); // the set-up state may have changed since the page loaded (e.g. GitHub was just set up)
   const errors = {
     state: "That sign-in link had expired. Try again.",
     denied: "Sign-in was cancelled.",
@@ -363,6 +364,7 @@ function signinView({ params }) {
     el("h1", {}, "Sign in"),
     el("p", { class: "lead" }, `You see the repos your ${providers.join(" or ")} account can read.${providers.length > 1 ? " Sign in with both to see both." : ""}`),
     params.get("error") ? el("p", { class: "form-error", role: "alert" }, errors[params.get("error")] ?? "Sign-in failed.") : "",
+    providers.length ? "" : el("p", {}, "Nothing to sign in with yet. ", el("a", { href: "#/connections" }, "Set up GitHub or GitLab"), " first."),
     el("div", { class: "row-actions" },
       me.github.configured ? el("a", { class: "btn primary", href: "/auth/github/login" }, "Sign in with GitHub") : "",
       me.gitlab.configured ? el("a", { class: `btn${me.github.configured ? "" : " primary"}`, href: "/auth/gitlab/login" }, "Sign in with GitLab") : ""),
@@ -584,7 +586,7 @@ async function render() {
   const ticket = ++rendering;
   try {
     if (!me) await loadMe();
-    if (r.parts[0] === "signin") return signinView(r);
+    if (r.parts[0] === "signin") return await signinView(r);
     if (me.authRequired && !me.signedIn) { location.hash = "#/signin"; return; }
     if (r.parts[0] === "work" && r.parts[1]) await intentView(r);
     else if (r.parts[0] === "work") await workView(r);
