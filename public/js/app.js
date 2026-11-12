@@ -361,7 +361,7 @@ function signinView({ params }) {
   const providers = [me.github.configured && "GitHub", me.gitlab.configured && "GitLab"].filter(Boolean);
   main.replaceChildren(
     el("h1", {}, "Sign in"),
-    el("p", { class: "lead" }, `You see the repos your ${providers.join(" or ")} account can read. Sign in with both to see both.`),
+    el("p", { class: "lead" }, `You see the repos your ${providers.join(" or ")} account can read.${providers.length > 1 ? " Sign in with both to see both." : ""}`),
     params.get("error") ? el("p", { class: "form-error", role: "alert" }, errors[params.get("error")] ?? "Sign-in failed.") : "",
     el("div", { class: "row-actions" },
       me.github.configured ? el("a", { class: "btn primary", href: "/auth/github/login" }, "Sign in with GitHub") : "",
@@ -442,7 +442,7 @@ function gitlabSection(repos) {
       el("h2", {}, "GitLab"),
       el("p", {}, "GitLab needs two things from you. The tracker only ever reads."),
       el("ol", { class: "steps" },
-        el("li", {}, "On GitLab, add an OAuth application (Preferences, then Applications). Give it the redirect URI ",
+        el("li", {}, "On GitLab, add an OAuth application: your avatar, Edit profile, then Applications (or a group's Settings, then Applications). Give it the redirect URI ",
           el("code", {}, gl.redirectUri), ", tick Confidential, and choose only the ", el("code", {}, "read_api"), " scope. This is how people sign in."),
         el("li", {}, "Create an access token with only the ", el("code", {}, "read_api"), " scope. A group access token is best, so reading does not depend on one person; a personal access token works too. The tracker reads projects with it.")),
       form, errorP);
