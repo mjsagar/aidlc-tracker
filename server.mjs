@@ -10,6 +10,7 @@
 //   LOCAL_REPOS          folders to track on start, separated by the platform path delimiter (":" on macOS and Linux)
 //   POLL_SECONDS         how often local folders are re-read, default 30 (0 = off)
 //   GITHUB_POLL_SECONDS  how often tracked GitHub branches are checked, default 30 (0 = off); unchanged checks are free
+//   GITLAB_POLL_SECONDS  how often tracked GitLab branches are checked, default 30 (0 = off)
 //   ALLOW_LOCAL_REPOS    1 or 0 to override the loopback rule
 
 import { delimiter } from "node:path";
@@ -28,6 +29,7 @@ const { server } = createApp({
   setupToken: process.env.SETUP_TOKEN || null,
   pollSeconds: num(process.env.POLL_SECONDS, 30),
   githubPollSeconds: num(process.env.GITHUB_POLL_SECONDS, 30),
+  gitlabPollSeconds: num(process.env.GITLAB_POLL_SECONDS, 30),
   localRepos: (process.env.LOCAL_REPOS ?? "").split(delimiter).map((s) => s.trim()).filter(Boolean),
   log: (s) => console.log(s),
 });

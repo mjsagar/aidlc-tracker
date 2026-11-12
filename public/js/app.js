@@ -26,8 +26,11 @@ async function loadMe() {
   const box = document.getElementById("account");
   box.replaceChildren();
   if (me.signedIn) {
+    const also = !me.user.gitlab && me.gitlab.configured ? el("a", { class: "btn link small", href: "/auth/gitlab/login" }, "Also sign in with GitLab")
+      : !me.user.github && me.github.configured ? el("a", { class: "btn link small", href: "/auth/github/login" }, "Also sign in with GitHub") : "";
     box.append(
-      el("span", { class: "who-am-i" }, me.user.login),
+      el("span", { class: "who-am-i", title: [me.user.github && `GitHub: ${me.user.github}`, me.user.gitlab && `GitLab: ${me.user.gitlab}`].filter(Boolean).join(", ") }, me.user.login),
+      also,
       el("button", { type: "button", class: "btn link small", onclick: async () => {
         await api("/api/auth/signout", { method: "POST", body: "{}" });
         await loadMe();
@@ -41,7 +44,7 @@ async function loadMe() {
 function fileLink(file, line, url) {
   return el("div", { class: "path" },
     el("code", {}, `${file}${line ? `:${line}` : ""}`),
-    url ? el("a", { class: "btn link small", href: url, target: "_blank", rel: "noopener noreferrer" }, "Open on GitHub")
+    url ? el("a", { class: "btn link small", href: url, target: "_blank", rel: "noopener noreferrer" }, url.includes("/-/blob/") ? "Open on GitLab" : "Open on GitHub")
       : el("button", { type: "button", class: "btn link small", onclick: () => copy(file) }, "Copy path"));
 }
 const phaseKey = (p) => (p ?? "").toLowerCase();
@@ -351,15 +354,18 @@ function signinView({ params }) {
   setNav("");
   const errors = {
     state: "That sign-in link had expired. Try again.",
-    denied: "GitHub sign-in was cancelled.",
-    failed: "GitHub did not complete the sign-in. Try again.",
+    denied: "Sign-in was cancelled.",
+    failed: "Sign-in did not complete. Try again.",
   };
   if (me?.signedIn) { location.hash = "#/"; return; }
+  const providers = [me.github.configured && "GitHub", me.gitlab.configured && "GitLab"].filter(Boolean);
   main.replaceChildren(
     el("h1", {}, "Sign in"),
-    el("p", { class: "lead" }, "The tracker shows the repos your GitHub account can read through its GitHub App."),
+    el("p", { class: "lead" }, `You see the repos your ${providers.join(" or ")} account can read. Sign in with both to see both.`),
     params.get("error") ? el("p", { class: "form-error", role: "alert" }, errors[params.get("error")] ?? "Sign-in failed.") : "",
-    el("a", { class: "btn primary", href: "/auth/github/login" }, "Sign in with GitHub"),
+    el("div", { class: "row-actions" },
+      me.github.configured ? el("a", { class: "btn primary", href: "/auth/github/login" }, "Sign in with GitHub") : "",
+      me.gitlab.configured ? el("a", { class: `btn${me.github.configured ? "" : " primary"}`, href: "/auth/gitlab/login" }, "Sign in with GitLab") : ""),
   );
 }
 
@@ -408,12 +414,89 @@ function githubSection() {
     form, errorP);
 }
 
+
+function gitlabSection(repos) {
+  const gl = me.gitlab;
+  if (!gl.configured) {
+    if (!gl.canSetUp) return el("section", { class: "gh" }, el("h2", {}, "GitLab"), el("p", { class: "muted" }, "GitLab is not set up. Set it up from the computer running the tracker."));
+    const id = el("input", { type: "text", name: "clientId", autocomplete: "off", spellcheck: "false", required: true });
+    const secret = el("input", { type: "password", name: "clientSecret", autocomplete: "off", required: true });
+    const token = el("input", { type: "password", name: "token", autocomplete: "off", required: true });
+    const errorP = el("p", { class: "form-error", role: "alert", hidden: true });
+    const btn = el("button", { type: "submit", class: "btn primary" }, "Connect GitLab");
+    const form = el("form", { class: "stack-form", onsubmit: async (e) => {
+      e.preventDefault();
+      errorP.hidden = true; btn.disabled = true; btn.textContent = "Checking";
+      try {
+        const r = await api("/api/gitlab/setup", { method: "POST", body: JSON.stringify({ clientId: id.value, clientSecret: secret.value, token: token.value }) });
+        toast(`GitLab connected as ${r.account}`);
+        await loadMe();
+        location.hash = "#/signin";
+      } catch (err) { errorP.textContent = err.message; errorP.hidden = false; btn.disabled = false; btn.textContent = "Connect GitLab"; }
+    } },
+      el("label", { class: "field" }, "Application ID", id),
+      el("label", { class: "field" }, "Secret", secret),
+      el("label", { class: "field" }, "Access token with read_api", token),
+      btn);
+    return el("section", { class: "gh" },
+      el("h2", {}, "GitLab"),
+      el("p", {}, "GitLab needs two things from you. The tracker only ever reads."),
+      el("ol", { class: "steps" },
+        el("li", {}, "On GitLab, add an OAuth application (Preferences, then Applications). Give it the redirect URI ",
+          el("code", {}, gl.redirectUri), ", tick Confidential, and choose only the ", el("code", {}, "read_api"), " scope. This is how people sign in."),
+        el("li", {}, "Create an access token with only the ", el("code", {}, "read_api"), " scope. A group access token is best, so reading does not depend on one person; a personal access token works too. The tracker reads projects with it.")),
+      form, errorP);
+  }
+
+  const expires = gl.tokenExpiresAt ? Date.parse(gl.tokenExpiresAt) : null;
+  const soon = expires && expires - Date.now() < 14 * 864e5;
+  const tokenInput = el("input", { type: "password", name: "token", autocomplete: "off", placeholder: "New access token", "aria-label": "New GitLab access token" });
+  const replace = el("form", { class: "branch-add", onsubmit: async (e) => {
+    e.preventDefault();
+    try { const r = await api("/api/gitlab/token", { method: "PUT", body: JSON.stringify({ token: tokenInput.value }) }); toast(`Token replaced; reading as ${r.account}`); render(); }
+    catch (err) { toast(err.message); }
+  } }, tokenInput, el("button", { type: "submit", class: "btn small" }, "Replace token"));
+
+  let addBlock;
+  if (!me.user?.gitlab) {
+    addBlock = el("p", {}, el("a", { href: "/auth/gitlab/login" }, "Sign in with GitLab"), " to add projects. You can add projects your own GitLab account can read.");
+  } else {
+    const path = el("input", { type: "text", name: "path", placeholder: "group/project", autocomplete: "off", spellcheck: "false", required: true, list: "gl-projects" });
+    const options = el("datalist", { id: "gl-projects" });
+    api("/api/gitlab/projects").then((list) => options.replaceChildren(...list.filter((x) => !x.tracked).map((x) => el("option", { value: x.path })))).catch(() => {});
+    const errorP = el("p", { class: "form-error", role: "alert", hidden: true });
+    const btn = el("button", { type: "submit", class: "btn primary" }, "Track project");
+    addBlock = el("div", {}, el("form", { class: "add-form", onsubmit: async (e) => {
+      e.preventDefault();
+      errorP.hidden = true; btn.disabled = true; btn.textContent = "Reading";
+      try {
+        const r = await api("/api/gitlab/projects", { method: "POST", body: JSON.stringify({ path: path.value }) });
+        toast(`${r.name}: ${plural(r.intents, "piece")} of work found`);
+        render();
+      } catch (err) { errorP.textContent = err.message; errorP.hidden = false; btn.disabled = false; btn.textContent = "Track project"; }
+    } }, el("label", { class: "field" }, "GitLab project path or URL", path), options, btn), errorP);
+  }
+
+  return el("section", { class: "gh" },
+    el("h2", {}, "GitLab"),
+    el("p", {}, `Reading projects as ${gl.account ?? "unknown"}`, expires ? `; the access token expires on ${fullDate(gl.tokenExpiresAt).split(",")[0]}.` : "; the access token does not expire."),
+    soon ? el("p", { class: "form-error" }, "The access token expires within 14 days. Create a new one and replace it here, or tracking stops.") : "",
+    el("p", { class: "muted small" }, "Tracked branches are checked every 30 seconds."),
+    gl.webhook ? el("details", {}, el("summary", {}, "Get updates instantly with a webhook"),
+      el("p", { class: "small" }, "A Maintainer adds this webhook to each project (Settings, then Webhooks), with Push events only:"),
+      el("p", { class: "small" }, "URL ", el("code", {}, gl.webhook.url)),
+      el("p", { class: "small" }, "Secret token ", el("code", {}, gl.webhook.secret))) : "",
+    addBlock,
+    el("details", {}, el("summary", {}, "Replace the access token"), replace));
+}
+
 async function connectionsView({ params }) {
   setNav("connections");
   await loadMe();
   const repos = await api("/api/repos");
   const local = repos.filter((r) => r.platform === "local");
-  const remote = repos.filter((r) => r.platform !== "local");
+  const remote = repos.filter((r) => r.platform === "github");
+  const gitlabRepos = repos.filter((r) => r.platform === "gitlab");
 
   const errorP = el("p", { class: "form-error", role: "alert", hidden: true });
   const input = el("input", { type: "text", name: "path", placeholder: "/Users/you/code/my-repo", autocomplete: "off", required: true, spellcheck: "false" });
@@ -436,7 +519,7 @@ async function connectionsView({ params }) {
     catch (err) { toast(err.message); btn.disabled = false; btn.textContent = "Read again"; }
   };
   const remove = async (r) => {
-    if (!confirm(`Stop tracking ${r.name}? Its questions and history are removed from the tracker. The folder itself is not touched.`)) return;
+    if (!confirm(`Stop tracking ${r.name}? Its questions and history are removed from the tracker. The ${r.platform === "local" ? "folder" : "project"} itself is not touched.`)) return;
     try { await api(`/api/repos/${r.id}`, { method: "DELETE" }); toast(`${r.name} removed`); render(); }
     catch (err) { toast(err.message); }
   };
@@ -474,7 +557,7 @@ async function connectionsView({ params }) {
         el("td", { "data-label": "Branches" }, branchCell(r)),
         el("td", { "data-label": "AI-DLC" }, r.aidlcVersion ?? "Not pinned"),
         el("td", {}, el("div", { class: "actions" }, btn,
-          r.platform === "local" ? el("button", { type: "button", class: "btn danger", onclick: () => remove(r) }, "Remove") : "")));
+          r.platform !== "github" ? el("button", { type: "button", class: "btn danger", onclick: () => remove(r) }, "Remove") : "")));
     })));
 
   main.replaceChildren(
@@ -483,6 +566,8 @@ async function connectionsView({ params }) {
     params.get("error") === "setup" ? el("p", { class: "form-error", role: "alert" }, "GitHub setup did not finish. Start it again.") : "",
     githubSection(),
     remote.length ? table(remote) : me.github.configured ? el("p", { class: "muted" }, "No GitHub repos yet. Choose repos on GitHub, then check GitHub.") : "",
+    gitlabSection(gitlabRepos),
+    gitlabRepos.length ? table(gitlabRepos) : "",
     el("h2", {}, "Folders on this computer"),
     me.allowLocal ? form : el("p", { class: "muted" }, "Adding local folders is turned off on this server."),
     errorP,

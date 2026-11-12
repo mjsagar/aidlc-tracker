@@ -196,6 +196,39 @@ const MIGRATIONS = [
   );
   CREATE TABLE oauth_states (state TEXT PRIMARY KEY, purpose TEXT NOT NULL, data TEXT, created_at INTEGER NOT NULL);
   `,
+  // 2 -> 3: GitLab (milestone 4); a session can hold a GitHub and a GitLab sign-in
+  `
+  CREATE TABLE gitlab_app (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    base_url TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    client_secret_enc TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  );
+  ALTER TABLE connections ADD COLUMN token_expires_at TEXT;
+
+  CREATE TABLE sessions_v3 (
+    id_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    github_login TEXT,
+    github_token_enc TEXT,
+    github_repo_ids_json TEXT,
+    github_checked_at TEXT,
+    gitlab_login TEXT,
+    gitlab_token_enc TEXT,
+    gitlab_refresh_enc TEXT,
+    gitlab_expires_at TEXT,
+    gitlab_project_ids_json TEXT,
+    gitlab_checked_at TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+  );
+  INSERT INTO sessions_v3 (id_hash, user_id, github_login, github_token_enc, github_repo_ids_json, github_checked_at, created_at, expires_at)
+    SELECT s.id_hash, s.user_id, u.login, s.token_enc, s.repo_ids_json, s.checked_at, s.created_at, s.expires_at
+    FROM sessions s JOIN users u ON u.id = s.user_id;
+  DROP TABLE sessions;
+  ALTER TABLE sessions_v3 RENAME TO sessions;
+  `,
 ];
 
 export function openDb(path) {

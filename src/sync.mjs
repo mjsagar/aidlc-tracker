@@ -8,6 +8,7 @@ import { basename, join, resolve } from "node:path";
 import { tx } from "./db.mjs";
 import { readLocalRepo } from "./source/local.mjs";
 import { readGithubBranch } from "./source/github.mjs";
+import { readGitlabBranch } from "./source/gitlab.mjs";
 import { parseRepo } from "./parse/repo.mjs";
 import { PARSER_VERSION } from "./version.mjs";
 
@@ -138,10 +139,11 @@ export function enqueueBackfill(db, connectionId, reason) {
 /** Lists the installation's repos; adds new ones with their default branch tracked, removes ones no longer granted. */
 async function backfill(ctx, connectionId) {
   const { db } = ctx;
-  const client = ctx.github();
-  if (!client) throw new Error("GitHub is not set up");
   const conn = db.prepare("SELECT * FROM connections WHERE id = ?").get(connectionId);
   if (!conn) return { repos: 0 };
+  if (conn.platform === "gitlab") return refreshGitlabProjects(ctx, conn);
+  const client = ctx.github();
+  if (!client) throw new Error("GitHub is not set up");
   const repos = await client.installationRepos(conn.external_id);
   const ids = new Set(repos.map((r) => String(r.id)));
   tx(db, () => {
@@ -161,6 +163,46 @@ async function backfill(ctx, connectionId) {
   });
   for (const b of db.prepare(`SELECT b.id FROM branches b JOIN repos r ON r.id = b.repo_id
     WHERE r.connection_id = ? AND b.tracked = 1 AND r.tracked = 1`).all(connectionId)) enqueue(db, b.id, "backfill");
+  return { repos: repos.length };
+}
+
+// ---------- GitLab projects
+
+/** Tracks a GitLab project (as returned by the projects API) with its default branch. Returns {repoId, branchId, created}. */
+export function addGitlabProject(db, connectionId, project) {
+  if (!project.default_branch) throw Object.assign(new Error(`${project.path_with_namespace} has no default branch yet`), { status: 400 });
+  return tx(db, () => {
+    const existing = db.prepare("SELECT id FROM repos WHERE connection_id = ? AND platform_repo_id = ?").get(connectionId, String(project.id));
+    db.prepare(`INSERT INTO repos (connection_id, platform_repo_id, full_name, default_branch, web_url) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT (connection_id, platform_repo_id) DO UPDATE SET full_name = excluded.full_name, default_branch = excluded.default_branch, web_url = excluded.web_url`)
+      .run(connectionId, String(project.id), project.path_with_namespace, project.default_branch, project.web_url);
+    const repoId = db.prepare("SELECT id FROM repos WHERE connection_id = ? AND platform_repo_id = ?").get(connectionId, String(project.id)).id;
+    let branch = db.prepare("SELECT id FROM branches WHERE repo_id = ? ORDER BY id LIMIT 1").get(repoId);
+    if (!branch) branch = { id: Number(db.prepare("INSERT INTO branches (repo_id, name) VALUES (?, ?)").run(repoId, project.default_branch).lastInsertRowid) };
+    return { repoId, branchId: branch.id, created: !existing };
+  });
+}
+
+/** Re-reads each tracked project's name, path and default branch; a project the token can no longer read is flagged, not deleted. */
+async function refreshGitlabProjects(ctx, conn) {
+  const { db } = ctx;
+  const client = ctx.gitlab();
+  if (!client) throw new Error("GitLab is not set up");
+  const token = ctx.connectionToken(conn.id);
+  const repos = db.prepare("SELECT * FROM repos WHERE connection_id = ?").all(conn.id);
+  for (const r of repos) {
+    try {
+      const p = await client.project(token, r.platform_repo_id);
+      db.prepare("UPDATE repos SET full_name = ?, default_branch = ?, web_url = ? WHERE id = ?").run(p.path_with_namespace, p.default_branch, p.web_url, r.id);
+    } catch (err) {
+      if (err.status === 404 || err.status === 403) {
+        db.prepare("UPDATE branches SET sync_error = ? WHERE repo_id = ?").run("The GitLab access token can no longer read this project", r.id);
+        continue;
+      }
+      throw err;
+    }
+    for (const b of db.prepare("SELECT id FROM branches WHERE repo_id = ? AND tracked = 1").all(r.id)) enqueue(db, b.id, "backfill");
+  }
   return { repos: repos.length };
 }
 
@@ -246,6 +288,7 @@ export async function syncBranch(ctx, branchId, { force = false } = {}) {
   if (!branch) throw new Error(`No branch ${branchId}`);
   const repo = db.prepare("SELECT r.*, c.platform, c.external_id FROM repos r JOIN connections c ON c.id = r.connection_id WHERE r.id = ?").get(branch.repo_id);
   if (repo.platform === "github") return syncGithubBranch(ctx, repo, branch, { force: force || Boolean(branch.sync_error) });
+  if (repo.platform === "gitlab") return syncGitlabBranch(ctx, repo, branch, { force: force || Boolean(branch.sync_error) });
   if (repo.platform !== "local") throw new Error(`${repo.platform} repos are not supported yet`);
   if (!existsSync(repo.local_path)) throw new Error(`Folder no longer exists: ${repo.local_path}`);
 
@@ -268,13 +311,30 @@ export async function syncBranch(ctx, branchId, { force = false } = {}) {
 }
 
 async function syncGithubBranch(ctx, repo, branch, { force }) {
-  const { db } = ctx;
   const client = ctx.github();
   if (!client) throw new Error("GitHub is not set up");
-  const getBlob = (sha) => db.prepare("SELECT content FROM blobs WHERE sha = ?").get(sha)?.content;
   const read = await readGithubBranch(client, {
-    installationId: repo.external_id, fullName: repo.full_name, branch: branch.name, lastTreeKey: branch.last_tree_sha, force, getBlob,
+    installationId: repo.external_id, fullName: repo.full_name, branch: branch.name, lastTreeKey: branch.last_tree_sha, force, getBlob: blobGetter(ctx.db),
   });
+  return storeRemoteRead(ctx.db, repo, branch, read);
+}
+
+async function syncGitlabBranch(ctx, repo, branch, { force }) {
+  const client = ctx.gitlab();
+  if (!client) throw new Error("GitLab is not set up");
+  const token = ctx.connectionToken(repo.connection_id);
+  if (!token) throw new Error("No GitLab access token for this connection");
+  const read = await readGitlabBranch(client, {
+    token, projectId: repo.platform_repo_id, branch: branch.name, lastCommitSha: branch.last_commit_sha, lastTreeKey: branch.last_tree_sha,
+    force, getBlob: blobGetter(ctx.db),
+  });
+  return storeRemoteRead(ctx.db, repo, branch, read);
+}
+
+const blobGetter = (db) => (sha) => db.prepare("SELECT content FROM blobs WHERE sha = ?").get(sha)?.content;
+
+/** Stores what a GitHub or GitLab reader returned: new blobs, the branch's file list, and the parsed snapshot. */
+function storeRemoteRead(db, repo, branch, read) {
   const at = nowIso();
   if (read.unchanged) {
     db.prepare("UPDATE branches SET last_synced_at = ?, last_commit_sha = ? WHERE id = ?").run(at, read.commitSha, branch.id);

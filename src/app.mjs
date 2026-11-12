@@ -7,12 +7,15 @@ import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openDb } from "./db.mjs";
 import {
-  addBranch, addLocalRepo, enqueue, enqueueAll, enqueueBackfill, removeBranch, removeInstallation, removeRepo, runAllJobs, upsertInstallation,
+  addBranch, addGitlabProject, addLocalRepo, enqueue, enqueueAll, enqueueBackfill, removeBranch, removeInstallation, removeRepo, runAllJobs,
+  upsertInstallation,
 } from "./sync.mjs";
 import { GitHubClient } from "./github/client.mjs";
 import { handleGithubWebhook } from "./github/webhooks.mjs";
-import { createSession, currentSession, deleteSession, newState, sessionCookie, takeState } from "./auth.mjs";
-import { decrypt, encrypt, loadKey, randomToken, safeEqual } from "./secrets.mjs";
+import { GitLabClient, pkcePair } from "./gitlab/client.mjs";
+import { handleGitlabWebhook } from "./gitlab/webhooks.mjs";
+import { COOKIE, currentSession, deleteSession, newState, parseCookies, sessionCookie, signIn, takeState } from "./auth.mjs";
+import { decrypt, encrypt, loadKey, randomToken, safeEqual, sha256 } from "./secrets.mjs";
 import { PARSER_VERSION, AIDLC_CHECKED_AGAINST } from "./version.mjs";
 
 const PUBLIC = fileURLToPath(new URL("../public/", import.meta.url));
@@ -32,8 +35,9 @@ const isLoopback = (addr) => ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(a
  *   fetchImpl?: typeof fetch, log?: (s: string) => void}} opts
  */
 export function createApp({
-  dbPath = ":memory:", allowLocal = true, pollSeconds = 30, githubPollSeconds = 30, localRepos = [],
+  dbPath = ":memory:", allowLocal = true, pollSeconds = 30, githubPollSeconds = 30, gitlabPollSeconds = 30, localRepos = [],
   publicUrl = "http://127.0.0.1:3100", setupToken = null, githubApiUrl = "https://api.github.com", githubWebUrl = "https://github.com",
+  gitlabUrl = "https://gitlab.com",
   secretKey, fetchImpl, log = () => {},
 } = {}) {
   const db = openDb(dbPath);
@@ -64,7 +68,38 @@ export function createApp({
   };
   // A bare client for the one call made before any app exists (manifest conversion).
   const bareGithub = () => new GitHubClient({ apiUrl: githubApiUrl, webUrl: githubWebUrl, fetchImpl });
-  const ctx = { db, key, github, log, webhookSecret: () => { const r = appRow(); return r?.webhook_secret_enc ? decrypt(key, r.webhook_secret_enc) : null; } };
+
+  // ---------- GitLab: an OAuth application for sign-in, plus a read_api token per connection for reading projects
+
+  let glClient = null;
+  let glFor = null;
+  const gitlabRow = () => db.prepare("SELECT * FROM gitlab_app WHERE id = 1").get();
+  const gitlab = () => {
+    const row = gitlabRow();
+    if (!row) return null;
+    if (glFor !== row.client_id) {
+      glClient = new GitLabClient({ baseUrl: row.base_url, clientId: row.client_id, clientSecret: decrypt(key, row.client_secret_enc), fetchImpl });
+      glFor = row.client_id;
+    }
+    return glClient;
+  };
+  const gitlabConnection = () => db.prepare("SELECT * FROM connections WHERE platform = 'gitlab' ORDER BY id LIMIT 1").get();
+  const connectionToken = (connectionId) => {
+    const row = db.prepare("SELECT credentials_enc FROM connections WHERE id = ?").get(connectionId);
+    return row?.credentials_enc ? decrypt(key, row.credentials_enc) : null;
+  };
+  /** The tracked GitLab project ids a person's own token can read. */
+  const gitlabVisible = async (userToken) => {
+    const c = gitlab();
+    const out = [];
+    for (const r of db.prepare("SELECT DISTINCT r.platform_repo_id FROM repos r JOIN connections c ON c.id = r.connection_id WHERE c.platform = 'gitlab'").all()) {
+      try { await c.project(userToken, r.platform_repo_id); out.push(String(r.platform_repo_id)); }
+      catch (err) { if (err.status === 401) throw err; /* 403/404: not visible to them */ }
+    }
+    return out;
+  };
+  const ctx = { db, key, github, gitlab, connectionToken, gitlabVisible, log,
+    webhookSecret: () => { const r = appRow(); return r?.webhook_secret_enc ? decrypt(key, r.webhook_secret_enc) : null; } };
 
   // ---------- worker and schedules
 
@@ -99,6 +134,11 @@ export function createApp({
     kick();
   };
 
+  const reconcileGitlab = () => {
+    for (const c of db.prepare("SELECT id FROM connections WHERE platform = 'gitlab'").all()) enqueueBackfill(db, c.id, "reconcile");
+    kick();
+  };
+
   for (const path of localRepos) {
     try { addLocalRepo(db, path); } catch (err) { log(`Could not add ${path}: ${err.message}`); }
   }
@@ -109,16 +149,20 @@ export function createApp({
   const every = (seconds, fn) => { if (seconds > 0) { const t = setInterval(fn, seconds * 1000); t.unref(); timers.push(t); } };
   every(pollSeconds, () => { enqueueAll(db, "poll", { platform: "local" }); kick(); });
   every(githubPollSeconds, () => { if (appRow()) { enqueueAll(db, "poll", { platform: "github" }); kick(); } });
-  every(RECONCILE_MS / 1000, reconcileGithub);
+  every(gitlabPollSeconds, () => { if (gitlabRow()) { enqueueAll(db, "poll", { platform: "gitlab" }); kick(); } });
+  every(RECONCILE_MS / 1000, () => { reconcileGithub(); reconcileGitlab(); });
 
   // ---------- who can see what
 
-  const authRequired = () => Boolean(appRow());
+  const authRequired = () => Boolean(appRow() || gitlabRow());
   /** Repo ids (our rows) this request may see; null means all. */
   const visibleRepoIds = (session) => {
     if (!authRequired()) return null;
     const rows = db.prepare("SELECT r.id, r.platform_repo_id, c.platform FROM repos r JOIN connections c ON c.id = r.connection_id").all();
-    return new Set(rows.filter((r) => (r.platform === "local" ? allowLocal : session?.repoIds.has(r.platform_repo_id))).map((r) => r.id));
+    const visible = (r) => (r.platform === "local" ? allowLocal
+      : r.platform === "github" ? Boolean(session?.github?.repoIds.has(r.platform_repo_id))
+      : Boolean(session?.gitlab?.projectIds.has(r.platform_repo_id)));
+    return new Set(rows.filter(visible).map((r) => r.id));
   };
   const canSee = (vis, repoId) => vis === null || vis.has(repoId);
 
@@ -148,13 +192,14 @@ export function createApp({
   };
 
   const intentBase = `
-    SELECT i.*, r.id AS repo_id, r.full_name AS repo_name, r.web_url AS repo_url, b.name AS branch_name
-    FROM intents i JOIN branches b ON b.id = i.branch_id JOIN repos r ON r.id = b.repo_id`;
+    SELECT i.*, r.id AS repo_id, r.full_name AS repo_name, r.web_url AS repo_url, b.name AS branch_name, c.platform
+    FROM intents i JOIN branches b ON b.id = i.branch_id JOIN repos r ON r.id = b.repo_id JOIN connections c ON c.id = r.connection_id`;
   const openQuestionRows = db.prepare(`SELECT q.*, i.id AS intent_row FROM questions q JOIN intents i ON i.id = q.intent_id WHERE q.open = 1`);
 
   // Link to a file on GitHub at the tracked branch; null for local folders.
+  // GitHub links are <repo>/blob/<branch>/<path>; GitLab links are <project>/-/blob/<branch>/<path>.
   const fileUrl = (row, file, line) => (row.repo_url && file
-    ? `${row.repo_url}/blob/${encodeURIComponent(row.branch_name).replace(/%2F/g, "/")}/${file.split("/").map(encodeURIComponent).join("/")}${line ? `#L${line}` : ""}`
+    ? `${row.repo_url}/${row.platform === "gitlab" ? "-/" : ""}blob/${encodeURIComponent(row.branch_name).replace(/%2F/g, "/")}/${file.split("/").map(encodeURIComponent).join("/")}${line ? `#L${line}` : ""}`
     : null);
 
   const waitingSince = (snapshot, questions) => {
@@ -284,6 +329,35 @@ export function createApp({
     return m;
   }
 
+  /** Checks a GitLab access token: who it belongs to, that it has read_api, and when it expires. */
+  async function checkGitlabToken(client, token) {
+    let user, info;
+    try {
+      user = await client.currentUser(token);
+      info = await client.tokenInfo(token);
+    } catch (err) {
+      if (err.status === 401) throw httpError(400, "GitLab did not accept that access token");
+      throw err;
+    }
+    const scopes = info.scopes ?? [];
+    if (!scopes.includes("read_api") && !scopes.includes("api")) throw httpError(400, "The access token needs the read_api scope");
+    return { id: user.id, username: user.username, expiresAt: info.expires_at ? `${info.expires_at}T00:00:00Z` : null };
+  }
+
+  /** Whether the signed-in person's GitLab account can read one project; adds it to their session if so. */
+  async function gitlabVisibleOne(session, projectId) {
+    const row = db.prepare("SELECT * FROM sessions WHERE id_hash = ?").get(sha256(session.raw));
+    if (!row?.gitlab_token_enc) return false;
+    try { await gitlab().project(decrypt(key, row.gitlab_token_enc), projectId); }
+    catch (err) { if (err.status === 401 || err.status === 403 || err.status === 404) return false; throw err; }
+    const ids = new Set(JSON.parse(row.gitlab_project_ids_json ?? "[]").map(String));
+    ids.add(String(projectId));
+    db.prepare("UPDATE sessions SET gitlab_project_ids_json = ? WHERE id_hash = ?").run(JSON.stringify([...ids]), row.id_hash);
+    return true;
+  }
+  const refreshedSession = (req) => currentSession(ctx, req);
+  const tx = (fn) => { db.exec("BEGIN IMMEDIATE"); try { const out = fn(); db.exec("COMMIT"); return out; } catch (err) { db.exec("ROLLBACK"); throw err; } };
+
   const setupAllowed = (req) => isLoopback(req.socket.remoteAddress) || (setupToken && safeEqual(req.headers["x-setup-token"], setupToken));
 
   // ---------- HTTP
@@ -342,7 +416,7 @@ export function createApp({
         (SELECT COUNT(*) FROM sync_jobs WHERE state = 'queued') AS queued, (SELECT MAX(last_synced_at) FROM branches) AS lastSync,
         (SELECT COUNT(*) FROM branches WHERE sync_error IS NOT NULL) AS syncErrors`).get();
       return json(res, 200, { status: "healthy", parserVersion: PARSER_VERSION, aidlcCheckedAgainst: AIDLC_CHECKED_AGAINST,
-        allowLocal, github: Boolean(appRow()), ...counts, githubRateRemaining: client?.rate.remaining ?? null,
+        allowLocal, github: Boolean(appRow()), gitlab: Boolean(gitlabRow()), ...counts, githubRateRemaining: client?.rate.remaining ?? null,
         uptime: Math.round((Date.now() - started) / 1000) });
     }
 
@@ -367,10 +441,43 @@ export function createApp({
         const { access_token: token } = await c.exchangeCode(q.get("code"), `${base}/auth/github/callback`);
         const user = await c.currentUser(token);
         const repoIds = await c.userRepoIds(token);
-        const raw = createSession(db, key, { user, token, repoIds });
+        const raw = signIn(db, key, { provider: "github", user: { id: user.id, login: user.login, name: user.name, avatarUrl: user.avatar_url },
+          login: user.login, token, repoIds }, parseCookies(req.headers.cookie)[COOKIE]);
         return redirect(res, "/#/", { "Set-Cookie": sessionCookie(raw, { secure: secureCookies }) });
       } catch (err) {
         log(`Sign-in failed: ${err.message}`);
+        return redirect(res, "/#/signin?error=failed");
+      }
+    }
+
+    if (p === "/api/webhooks/gitlab" && req.method === "POST") {
+      const raw = await readRaw(req, MAX_WEBHOOK_BODY);
+      const result = handleGitlabWebhook(ctx, { event: req.headers["x-gitlab-event"], uuid: req.headers["x-gitlab-event-uuid"],
+        token: req.headers["x-gitlab-token"], raw });
+      if (result.status === 202) kick();
+      return json(res, result.status, result.body);
+    }
+
+    if (p === "/auth/gitlab/login" && req.method === "GET") {
+      const c = gitlab();
+      if (!c) return redirect(res, "/#/connections");
+      const { verifier, challenge } = pkcePair();
+      return redirect(res, c.authorizeUrl({ state: newState(db, "gitlab-signin", { verifier }), redirectUri: `${base}/auth/gitlab/callback`, challenge }));
+    }
+    if (p === "/auth/gitlab/callback" && req.method === "GET") {
+      const c = gitlab();
+      const state = c ? takeState(db, q.get("state"), "gitlab-signin") : null;
+      if (!state) return redirect(res, "/#/signin?error=state");
+      if (!q.get("code")) return redirect(res, "/#/signin?error=denied");
+      try {
+        const t = await c.exchangeCode(q.get("code"), `${base}/auth/gitlab/callback`, state.verifier);
+        const user = await c.currentUser(t.token);
+        const projectIds = await gitlabVisible(t.token);
+        const raw = signIn(db, key, { provider: "gitlab", user: { id: user.id, login: user.username, name: user.name, avatarUrl: user.avatar_url },
+          login: user.username, token: t.token, refresh: t.refresh, expiresAt: t.expiresAt, projectIds }, parseCookies(req.headers.cookie)[COOKIE]);
+        return redirect(res, "/#/", { "Set-Cookie": sessionCookie(raw, { secure: secureCookies }) });
+      } catch (err) {
+        log(`GitLab sign-in failed: ${err.message}`);
         return redirect(res, "/#/signin?error=failed");
       }
     }
@@ -379,10 +486,18 @@ export function createApp({
 
     if (p === "/api/me" && req.method === "GET") {
       const row = appRow();
+      const gl = gitlabRow();
+      const glConn = gitlabConnection();
       return json(res, 200, {
-        signedIn: Boolean(session), authRequired: authRequired(), user: session ? { login: session.login, name: session.name, avatarUrl: session.avatarUrl } : null,
+        signedIn: Boolean(session), authRequired: authRequired(),
+        user: session ? { login: session.login, name: session.name, avatarUrl: session.avatarUrl, github: session.github?.login ?? null, gitlab: session.gitlab?.login ?? null } : null,
         github: row ? { configured: true, name: row.name, slug: row.slug, owner: row.owner, appUrl: row.html_url, installUrl: `${row.html_url}/installations/new` }
           : { configured: false, canSetUp: Boolean(setupAllowed(req)), webhooks: !publicIsLocal },
+        gitlab: gl ? {
+          configured: true, url: gl.base_url, account: glConn?.account ?? null, tokenExpiresAt: glConn?.token_expires_at ?? null,
+          // The webhook secret is shown only to signed-in people, and only when GitLab can reach the tracker.
+          webhook: session && !publicIsLocal && glConn ? { url: `${base}/api/webhooks/gitlab`, secret: decrypt(key, glConn.webhook_secret) } : null,
+        } : { configured: false, canSetUp: Boolean(setupAllowed(req)), url: gitlabUrl, redirectUri: `${base}/auth/gitlab/callback` },
         allowLocal,
       });
     }
@@ -390,6 +505,25 @@ export function createApp({
       await readJson(req);
       deleteSession(db, session?.raw);
       return json(res, 200, { signedOut: true }, { "Set-Cookie": sessionCookie("", { secure: secureCookies, clear: true }) });
+    }
+
+    // GitLab setup: the OAuth application (for sign-in) and a read_api token (for reading projects).
+    if (p === "/api/gitlab/setup" && req.method === "POST") {
+      if (gitlabRow()) throw httpError(409, "GitLab is already set up");
+      if (!setupAllowed(req)) throw httpError(403, "Set up GitLab from the computer running the tracker, or send the setup token");
+      const body = await readJson(req);
+      for (const f of ["clientId", "clientSecret", "token"]) if (typeof body[f] !== "string" || !body[f].trim()) throw httpError(400, `${f} is required`);
+      const probe = new GitLabClient({ baseUrl: gitlabUrl, fetchImpl });
+      const account = await checkGitlabToken(probe, body.token.trim());
+      tx(() => {
+        db.prepare("INSERT INTO gitlab_app (id, base_url, client_id, client_secret_enc) VALUES (1, ?, ?, ?)").run(gitlabUrl, body.clientId.trim(), encrypt(key, body.clientSecret.trim()));
+        const ws = db.prepare("SELECT id FROM workspaces ORDER BY id LIMIT 1").get();
+        db.prepare(`INSERT INTO connections (workspace_id, platform, host, account, external_id, credentials_enc, webhook_secret, token_expires_at)
+          VALUES (?, 'gitlab', ?, ?, ?, ?, ?, ?)`).run(ws.id, new URL(gitlabUrl).host, account.username, String(account.id),
+          encrypt(key, body.token.trim()), encrypt(key, randomToken(24)), account.expiresAt);
+      });
+      log(`GitLab set up with the token of ${account.username}`);
+      return json(res, 201, { account: account.username, tokenExpiresAt: account.expiresAt });
     }
 
     // GitHub app setup: allowed only before an app exists, from this computer or with the setup token.
@@ -449,7 +583,7 @@ export function createApp({
       }
       if ((match = m(/^\/api\/repos\/(\d+)$/)) && req.method === "DELETE") {
         const repo = repoFor(Number(match[1]));
-        if (repo.platform !== "local") throw httpError(400, "Remove GitHub repos from the app's installation settings on GitHub");
+        if (repo.platform === "github") throw httpError(400, "Remove GitHub repos from the app's installation settings on GitHub");
         removeRepo(db, repo.id);
         return json(res, 200, { removed: repo.id });
       }
@@ -479,6 +613,46 @@ export function createApp({
         if (!appRow()) throw httpError(400, "GitHub is not set up");
         await reconcileGithub(); await idle();
         return json(res, 200, { repos: repoList(vis) });
+      }
+      if (p === "/api/gitlab/token" && req.method === "PUT") {
+        const conn = gitlabConnection();
+        if (!conn) throw httpError(400, "GitLab is not set up");
+        const body = await readJson(req);
+        if (typeof body.token !== "string" || !body.token.trim()) throw httpError(400, "token is required");
+        const account = await checkGitlabToken(gitlab(), body.token.trim());
+        db.prepare("UPDATE connections SET credentials_enc = ?, account = ?, external_id = ?, token_expires_at = ? WHERE id = ?")
+          .run(encrypt(key, body.token.trim()), account.username, String(account.id), account.expiresAt, conn.id);
+        db.prepare(`UPDATE branches SET sync_error = NULL WHERE repo_id IN (SELECT id FROM repos WHERE connection_id = ?)`).run(conn.id);
+        enqueueBackfill(db, conn.id, "token");
+        await kick(); await idle();
+        return json(res, 200, { account: account.username, tokenExpiresAt: account.expiresAt });
+      }
+      if (p === "/api/gitlab/projects" && req.method === "GET") {
+        const conn = gitlabConnection();
+        if (!conn) throw httpError(400, "GitLab is not set up");
+        const tracked = new Set(db.prepare("SELECT platform_repo_id FROM repos WHERE connection_id = ?").all(conn.id).map((r) => r.platform_repo_id));
+        const list = await gitlab().memberProjects(connectionToken(conn.id), (q.get("search") ?? "").slice(0, 100));
+        // Offer only projects the person can read themselves, so the list does not reveal others.
+        const mine = session?.gitlab ? list : [];
+        return json(res, 200, mine.map((pr) => ({ id: pr.id, path: pr.path_with_namespace, webUrl: pr.web_url, tracked: tracked.has(String(pr.id)) })));
+      }
+      if (p === "/api/gitlab/projects" && req.method === "POST") {
+        const conn = gitlabConnection();
+        if (!conn) throw httpError(400, "GitLab is not set up");
+        if (!session?.gitlab) throw httpError(403, "Sign in with GitLab to add GitLab projects");
+        const body = await readJson(req);
+        const ref = typeof body.path === "string" ? body.path.trim().replace(/^https?:\/\/[^/]+\//, "").replace(/\.git$|\/$/g, "") : body.id;
+        if (!ref) throw httpError(400, "path is required");
+        let project;
+        try { project = await gitlab().project(connectionToken(conn.id), ref); }
+        catch (err) { if (err.status === 404 || err.status === 403) throw httpError(404, `The GitLab token cannot read ${ref}`); throw err; }
+        // The person adding it must be able to read it with their own account too.
+        const ownIds = await gitlabVisibleOne(session, project.id);
+        if (!ownIds) throw httpError(404, `Your GitLab account cannot read ${project.path_with_namespace}`);
+        const { repoId, branchId, created } = addGitlabProject(db, conn.id, project);
+        enqueue(db, branchId, "added");
+        await kick(); await idle();
+        return json(res, created ? 201 : 200, repoList(visibleRepoIds(await refreshedSession(req))).find((r) => r.id === repoId));
       }
       if (p === "/api/intents" && req.method === "GET") return json(res, 200, listIntents(q, vis));
       if ((match = m(/^\/api\/intents\/(\d+)$/)) && req.method === "GET") return json(res, 200, getIntent(Number(match[1]), vis));

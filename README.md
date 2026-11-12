@@ -4,7 +4,7 @@ Tracks AI-DLC work across repos: unanswered questions, stages waiting for approv
 
 Design: [AI-DLC Tracker: design](https://claude.ai/artifact/8Ws41qUugWrYiNkkC6DGT5).
 
-**Status:** milestone 3 of 5 (GitHub). Reads local checkouts and GitHub repos; GitLab comes in milestone 4. Checked against AI-DLC 2.11.3.
+**Status:** milestone 4 of 5 (GitLab). Reads local checkouts, GitHub repos and gitlab.com projects. Checked against AI-DLC 2.11.3.
 
 ## Run the tracker
 
@@ -14,7 +14,7 @@ Requires Node 22.5 or later. No npm dependencies.
 npm run dev      # http://127.0.0.1:3100, tracking the sample repo, restarts on file changes
 npm start        # same server without the sample repo; add folders on the Connections screen
 npm test
-node --disable-warning=ExperimentalWarning scripts/demo-github.mjs   # http://127.0.0.1:3101 against a fake GitHub
+node --disable-warning=ExperimentalWarning scripts/demo.mjs   # http://127.0.0.1:3101 against a fake GitHub and GitLab
 ```
 
 ## Connect GitHub
@@ -28,6 +28,17 @@ Set-up is allowed only from the computer running the tracker, or with `SETUP_TOK
 
 While the tracker runs on `localhost`, GitHub cannot deliver webhooks, so tracked branches are checked every 30 seconds with conditional requests; a check that finds nothing new returns 304 and does not count against GitHub's rate limit. When `PUBLIC_URL` is a public address, the app is created with a push webhook as well. Every 6 hours the tracker re-lists the app's installations to catch anything missed.
 
+## Connect GitLab (gitlab.com)
+
+GitLab has no one-click app set-up, so it takes two things you create on gitlab.com:
+
+1. An **OAuth application** (your avatar, Edit profile, Applications; or a group's Settings, Applications) with the redirect URI the Connections screen shows, Confidential ticked, and only the `read_api` scope. People sign in with it.
+2. An **access token** with only `read_api`. A group access token is best, so reading does not depend on one person; a personal access token works too. The tracker reads projects with it and warns 14 days before it expires; replace it on the Connections screen.
+
+Paste both on the Connections screen (from the computer running the tracker), sign in with GitLab, and add projects by path or URL. You can add only projects your own GitLab account can read, and each person sees only the projects their GitLab account can read. One session can be signed in to GitHub and GitLab at once.
+
+Tracked branches are checked every 30 seconds. Registering a webhook needs write access, so the tracker does not do it: when `PUBLIC_URL` is public, Connections shows a webhook URL and secret token for a Maintainer to add to each project (Push events). Every 6 hours the tracker re-reads each project's name and default branch; a project the token can no longer read is flagged, not deleted.
+
 Per repo you can track more branches on the Connections screen. Only files under `aidlc/` and `.aidlc-version` are downloaded, and a file is downloaded again only when its content changes.
 
 | Variable | Default | Meaning |
@@ -40,6 +51,7 @@ Per repo you can track more branches on the Connections screen. Only files under
 | `ALLOW_LOCAL_REPOS` | `1` on loopback, else `0` | Whether the Connections screen may add local folders |
 | `PUBLIC_URL` | `http://127.0.0.1:PORT` | Address people and GitHub use; webhooks are switched on when it is not localhost |
 | `GITHUB_POLL_SECONDS` | `30` | How often tracked GitHub branches are checked; `0` turns it off |
+| `GITLAB_POLL_SECONDS` | `30` | How often tracked GitLab branches are checked; `0` turns it off |
 | `TRACKER_SECRET_KEY` | generated into `secret.key` beside the database | 32 bytes, base64; encrypts stored GitHub credentials and sign-in tokens |
 | `SETUP_TOKEN` | none | Allows GitHub set-up from another computer |
 
@@ -58,9 +70,14 @@ The server reads a folder only when it is bound to loopback, unless `ALLOW_LOCAL
 | `POST /api/github/manifest` `{org?}` | Starts GitHub set-up; returns the form GitHub expects |
 | `POST /api/github/reconcile` | Re-lists the app's installations and repos now |
 | `POST /api/webhooks/github` | GitHub webhooks (signature checked, repeats ignored) |
+| `POST /api/gitlab/setup` `{clientId, clientSecret, token}` | Connects GitLab (from this computer or with the setup token) |
+| `PUT /api/gitlab/token` `{token}` | Replaces the GitLab access token |
+| `GET /api/gitlab/projects?search=`, `POST /api/gitlab/projects` `{path}` | Projects you can add; track one |
+| `POST /api/webhooks/gitlab` | GitLab webhooks (secret token checked, repeats ignored) |
+| `GET /auth/gitlab/login` | Sign in with GitLab (OAuth with PKCE) |
 | `GET /auth/github/login`, `POST /api/auth/signout` | Sign in and out |
 | `POST /api/repos` `{path}` | Adds a local folder and reads it |
-| `DELETE /api/repos/:id` | Stops tracking a local folder; deletes its rows |
+| `DELETE /api/repos/:id` | Stops tracking a local folder or GitLab project; deletes its rows |
 | `POST /api/repos/:id/resync` | Reads it again now |
 | `GET /api/intents?sort=blocked\|activity\|progress&repo=&phase=&stale=1` | Pieces of work |
 | `GET /api/intents/:id` | One piece of work with questions, events, approvals |
@@ -98,10 +115,13 @@ src/app.mjs               HTTP server, JSON API, static files
 src/db.mjs                SQLite schema (node:sqlite)
 src/sync.mjs              sync jobs: read, skip if unchanged, replace a branch's rows; installation backfill; retries after rate limits
 src/github/               GitHub App client (JWT, installation tokens, ETags, pagination) and webhook handler
-src/source/github.mjs     reads a branch's aidlc/ folder through the API, fetching only changed files
-src/auth.mjs              sign-in with GitHub, sessions, per-person repo visibility
+src/gitlab/               GitLab client (read_api token, OAuth with PKCE and refresh) and webhook handler
+src/source/github.mjs     reads a branch's aidlc/ folder through the GitHub API, fetching only changed files
+src/source/gitlab.mjs     the same for GitLab
+src/auth.mjs              sign-in with GitHub and GitLab, sessions, per-person repo visibility
 src/secrets.mjs           AES-256-GCM for stored credentials; webhook signature checks
-test/fake-github.mjs      a stand-in for the GitHub API used by the tests and the demo
+test/fake-github.mjs      stand-ins for the GitHub and GitLab APIs used by the tests and the demo
+test/fake-gitlab.mjs
 public/                   the screens: vanilla ES modules, no build step
 bin/aidlc-tracker.mjs     command-line tool
 src/parse/                one parser per file type, plus repo.mjs that builds a snapshot per intent

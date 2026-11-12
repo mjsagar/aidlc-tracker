@@ -154,7 +154,7 @@ test("sign-in: Priya sees both repos; Sam only sees the one he can read on GitHu
   assert.equal((await get(`/api/intents/${id}`, "sam")).status, 404, "a repo Sam cannot read is not found, not forbidden");
   const shopId = app.db.prepare("SELECT id FROM repos WHERE full_name = 'acme/shop'").get().id;
   assert.equal((await req("POST", `/api/repos/${shopId}/resync`, { as: "sam", body: {} })).status, 404);
-  const tok = app.db.prepare("SELECT token_enc FROM sessions LIMIT 1").get().token_enc;
+  const tok = app.db.prepare("SELECT github_token_enc FROM sessions LIMIT 1").get().github_token_enc;
   assert.ok(!tok.startsWith("ghu_"), "user tokens are stored encrypted");
 });
 
