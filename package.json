@@ -1,0 +1,18 @@
+{
+  "name": "aidlc-tracker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tracks AI-DLC open questions, approvals and progress across GitHub and GitLab repos.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "bin": {
+    "aidlc-tracker": "bin/aidlc-tracker.mjs"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "inbox": "node bin/aidlc-tracker.mjs inbox fixtures/repos/acme-shop",
+    "status": "node bin/aidlc-tracker.mjs status fixtures/repos/acme-shop"
+  }
+}

@@ -1,0 +1,193 @@
+// Audit event taxonomy from AI-DLC 2.11.3 docs/guide/10-state-and-audit.md (generated; do not edit by hand).
+export const EVENT_CATEGORIES = Object.freeze({
+  "Workflow Lifecycle": [
+    "WORKFLOW_STARTED",
+    "WORKFLOW_COMPLETED",
+    "WORKFLOW_PARKED",
+    "WORKFLOW_UNPARKED",
+    "WORKFLOW_ARCHIVED",
+    "WORKFLOW_UNARCHIVED",
+    "STATE_UPGRADED",
+    "INTENT_REPOS_CHANGED",
+    "INTENT_CHECKOUTS_CHANGED"
+  ],
+  "Phase Lifecycle": [
+    "PHASE_STARTED",
+    "PHASE_COMPLETED",
+    "PHASE_VERIFIED",
+    "PHASE_SKIPPED"
+  ],
+  "Stage Lifecycle": [
+    "STAGE_STARTED",
+    "STAGE_AWAITING_APPROVAL",
+    "STAGE_REVISING",
+    "STAGE_COMPLETED",
+    "STAGE_SKIPPED",
+    "STAGE_JUMPED",
+    "STAGE_DEFINITION_CHANGED",
+    "STAGE_OUTPUT_AMENDED",
+    "SOURCE_WORK_NOT_FOUND"
+  ],
+  "Session": [
+    "SESSION_STARTED",
+    "SESSION_RESUMED",
+    "SESSION_COMPACTED",
+    "SESSION_ENDED",
+    "HUMAN_TURN",
+    "HOST_TURN"
+  ],
+  "Initialization": [
+    "WORKSPACE_SCAFFOLDED",
+    "WORKSPACE_SCANNED",
+    "WORKSPACE_INITIALISED"
+  ],
+  "Navigation": [
+    "SCOPE_CHANGED",
+    "SCOPE_DETECTED",
+    "DEPTH_CHANGED",
+    "TEST_STRATEGY_CHANGED",
+    "REVIEW_CLASS_CHANGED",
+    "RECOMPOSED",
+    "WORKSPACE_RECLASSIFIED",
+    "SCOPE_SAVED",
+    "PLUGIN_SELECTION_CHANGED"
+  ],
+  "Guard Policy": [
+    "GUARD_POLICY_SET",
+    "CHANGE_CONTROL_SET",
+    "CHANGE_ACCEPTED",
+    "GUARD_RESTORED",
+    "GUARD_STOOD_ASIDE"
+  ],
+  "Ceremony": [
+    "CEREMONY_SET"
+  ],
+  "Interaction": [
+    "DECISION_RECORDED",
+    "GATE_APPROVED",
+    "GATE_REJECTED",
+    "QUESTION_ANSWERED",
+    "QUESTION_REPLIED",
+    "QUESTION_UNANSWERED",
+    "QUESTION_ASKED",
+    "QUESTION_SHOWN",
+    "REQUEST_ROUTED",
+    "SUMMARY_CONFIRMATION_RECORDED",
+    "VERIFICATION_COMMAND_RECORDED",
+    "CONSTRUCTION_POLICY_RECORDED",
+    "CHECKPOINT_VERIFICATION_RECORDED",
+    "PLAN_APPROVAL_RECORDED",
+    "PLAN_APPROVAL_SKIPPED",
+    "PLAN_APPROVAL_OVERRIDDEN",
+    "REVIEW_REQUESTED",
+    "REVIEW_COMPLETED",
+    "PIPELINE_LINK_COMPLETED"
+  ],
+  "Unit Configuration and Lifecycle": [
+    "UNIT_OWNERSHIP_SET",
+    "UNIT_GATE_RHYTHM_SET",
+    "CONSTRUCTION_POLICY_SET",
+    "UNIT_STARTED",
+    "UNIT_PAUSED",
+    "UNIT_RESUMED",
+    "UNIT_COMPLETED",
+    "UNIT_SKIPPED",
+    "UNIT_MERGED"
+  ],
+  "Artifact": [
+    "ARTIFACT_CREATED",
+    "ARTIFACT_UPDATED",
+    "ARTIFACT_REUSED"
+  ],
+  "Subagent": [
+    "SUBAGENT_DISPATCHED",
+    "SUBAGENT_COMPLETED",
+    "SUBAGENT_PROMPT_UNMATCHED",
+    "REVIEW_VERDICT_DICTATED"
+  ],
+  "Reviewer Enforcement": [
+    "REVIEWER_SCOPE_BLOCKED",
+    "REVIEW_FREEZE_BLOCKED"
+  ],
+  "Plan Approval": [
+    "PLAN_APPROVAL_BLOCKED",
+    "GUARD_DISABLED"
+  ],
+  "Guard Refusals": [
+    "STATE_TRANSITION_BLOCKED",
+    "STAGE_RULES_BLOCKED"
+  ],
+  "System Install": [
+    "SYSTEM_INSTALL_BLOCKED",
+    "SYSTEM_INSTALL_ALLOWED",
+    "SYSTEM_INSTALL_REQUESTED"
+  ],
+  "Documents": [
+    "DOCUMENT_INDEXED",
+    "DOCUMENT_UPDATED",
+    "DOCUMENT_REMOVED"
+  ],
+  "Utility": [
+    "HEALTH_CHECKED"
+  ],
+  "Error/Recovery": [
+    "ERROR_LOGGED",
+    "RECOVERY_COMPLETED",
+    "COORDINATION_STOOD_ASIDE"
+  ],
+  "Construction Bolt": [
+    "BOLT_STARTED",
+    "BOLT_COMPLETED",
+    "BOLT_FAILED",
+    "AUTONOMY_MODE_SET"
+  ],
+  "Worktree": [
+    "WORKTREE_CREATED",
+    "WORKTREE_MERGED",
+    "WORKTREE_DISCARDED",
+    "STATE_FORKED",
+    "STATE_MERGED",
+    "AUDIT_FORKED",
+    "AUDIT_MERGED"
+  ],
+  "Practices": [
+    "PRACTICES_DISCOVERED",
+    "PRACTICES_AFFIRMED",
+    "PRACTICES_OVERRIDE",
+    "PRACTICES_SECTION_EMPTY"
+  ],
+  "Merge Dispatch": [
+    "MERGE_DISPATCH_INVOKED",
+    "MERGE_DISPATCH_RETURNED",
+    "MERGE_DISPATCH_FALLBACK"
+  ],
+  "Sensors": [
+    "SENSOR_FIRED",
+    "SENSOR_PASSED",
+    "SENSOR_FAILED",
+    "SENSOR_COULD_NOT_RUN",
+    "SENSOR_BUDGET_OVERRIDE",
+    "GUARDRAIL_LOADED"
+  ],
+  "Learning Loop": [
+    "MEMORY_EMPTY",
+    "RULE_LEARNED",
+    "SENSOR_PROPOSED"
+  ],
+  "Swarm": [
+    "SWARM_STARTED",
+    "SWARM_UNIT_CONVERGED",
+    "SWARM_SOURCE_MERGED",
+    "SWARM_UNIT_FAILED",
+    "SWARM_BATON_RETURNED",
+    "SWARM_COMPLETED",
+    "SWARM_DEGRADED",
+    "MAIN_CHECKOUT_CHANGE_ALLOWED",
+    "SWARM_TAKEN_OVER"
+  ],
+  "Commit Provenance": [
+    "SOURCE_COMMITTED"
+  ]
+});
+
+export const KNOWN_EVENTS = new Set(Object.values(EVENT_CATEGORIES).flat());
