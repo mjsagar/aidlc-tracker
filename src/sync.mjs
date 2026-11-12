@@ -7,6 +7,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { tx } from "./db.mjs";
 import { readLocalRepo } from "./source/local.mjs";
+import { readGithubBranch } from "./source/github.mjs";
 import { parseRepo } from "./parse/repo.mjs";
 import { PARSER_VERSION } from "./version.mjs";
 
@@ -83,8 +84,15 @@ export function addLocalRepo(db, path) {
   });
 }
 
+/** Deletes cached file contents no tracked branch refers to any more. */
+export function pruneBlobs(db) {
+  return db.prepare("DELETE FROM blobs WHERE sha NOT IN (SELECT sha FROM files)").run().changes;
+}
+
 export function removeRepo(db, repoId) {
-  return db.prepare("DELETE FROM repos WHERE id = ?").run(repoId).changes > 0;
+  const removed = db.prepare("DELETE FROM repos WHERE id = ?").run(repoId).changes > 0;
+  pruneBlobs(db);
+  return removed;
 }
 
 /** Queues a sync unless one is already queued for that branch. Returns the job id. */
@@ -94,45 +102,151 @@ export function enqueue(db, branchId, reason) {
   return Number(db.prepare("INSERT INTO sync_jobs (branch_id, reason) VALUES (?, ?)").run(branchId, reason).lastInsertRowid);
 }
 
-export function enqueueAll(db, reason) {
-  const rows = db.prepare("SELECT b.id FROM branches b JOIN repos r ON r.id = b.repo_id WHERE b.tracked = 1 AND r.tracked = 1").all();
+/** Queues every tracked branch, optionally only those on one platform. */
+export function enqueueAll(db, reason, { platform } = {}) {
+  const rows = db.prepare(`SELECT b.id FROM branches b JOIN repos r ON r.id = b.repo_id JOIN connections c ON c.id = r.connection_id
+    WHERE b.tracked = 1 AND r.tracked = 1 AND (? IS NULL OR c.platform = ?)`).all(platform ?? null, platform ?? null);
   return rows.map((r) => enqueue(db, r.id, reason));
 }
 
-/** Runs the oldest queued job. Returns its result, or null when the queue is empty. */
-export function runNextJob(db) {
-  const job = db.prepare("SELECT * FROM sync_jobs WHERE state = 'queued' ORDER BY id LIMIT 1").get();
+// ---------- GitHub installations
+
+/** Records a GitHub App installation as a connection. Returns the connection id. */
+export function upsertInstallation(db, { installationId, account }) {
+  const existing = db.prepare("SELECT id FROM connections WHERE platform = 'github' AND external_id = ?").get(String(installationId));
+  if (existing) {
+    db.prepare("UPDATE connections SET account = ? WHERE id = ?").run(account, existing.id);
+    return existing.id;
+  }
+  const ws = db.prepare("SELECT id FROM workspaces ORDER BY id LIMIT 1").get();
+  return Number(db.prepare("INSERT INTO connections (workspace_id, platform, host, account, external_id) VALUES (?, 'github', 'github.com', ?, ?)")
+    .run(ws.id, account, String(installationId)).lastInsertRowid);
+}
+
+export function removeInstallation(db, installationId) {
+  const removed = db.prepare("DELETE FROM connections WHERE platform = 'github' AND external_id = ?").run(String(installationId)).changes > 0;
+  pruneBlobs(db);
+  return removed;
+}
+
+export function enqueueBackfill(db, connectionId, reason) {
+  const queued = db.prepare("SELECT id FROM connection_jobs WHERE connection_id = ? AND state = 'queued'").get(connectionId);
+  if (queued) return queued.id;
+  return Number(db.prepare("INSERT INTO connection_jobs (connection_id, reason) VALUES (?, ?)").run(connectionId, reason).lastInsertRowid);
+}
+
+/** Lists the installation's repos; adds new ones with their default branch tracked, removes ones no longer granted. */
+async function backfill(ctx, connectionId) {
+  const { db } = ctx;
+  const client = ctx.github();
+  if (!client) throw new Error("GitHub is not set up");
+  const conn = db.prepare("SELECT * FROM connections WHERE id = ?").get(connectionId);
+  if (!conn) return { repos: 0 };
+  const repos = await client.installationRepos(conn.external_id);
+  const ids = new Set(repos.map((r) => String(r.id)));
+  tx(db, () => {
+    for (const r of repos) {
+      db.prepare(`INSERT INTO repos (connection_id, platform_repo_id, full_name, default_branch, web_url) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (connection_id, platform_repo_id) DO UPDATE SET full_name = excluded.full_name, default_branch = excluded.default_branch, web_url = excluded.web_url`)
+        .run(connectionId, String(r.id), r.full_name, r.default_branch, r.html_url);
+      const repo = db.prepare("SELECT id FROM repos WHERE connection_id = ? AND platform_repo_id = ?").get(connectionId, String(r.id));
+      if (!db.prepare("SELECT 1 FROM branches WHERE repo_id = ?").get(repo.id)) {
+        db.prepare("INSERT INTO branches (repo_id, name) VALUES (?, ?)").run(repo.id, r.default_branch);
+      }
+    }
+    for (const row of db.prepare("SELECT id, platform_repo_id FROM repos WHERE connection_id = ?").all(connectionId)) {
+      if (!ids.has(row.platform_repo_id)) db.prepare("DELETE FROM repos WHERE id = ?").run(row.id);
+    }
+    pruneBlobs(db);
+  });
+  for (const b of db.prepare(`SELECT b.id FROM branches b JOIN repos r ON r.id = b.repo_id
+    WHERE r.connection_id = ? AND b.tracked = 1 AND r.tracked = 1`).all(connectionId)) enqueue(db, b.id, "backfill");
+  return { repos: repos.length };
+}
+
+// ---------- branches people choose to track
+
+export function addBranch(db, repoId, name) {
+  const clean = String(name ?? "").trim();
+  if (!clean || clean.length > 255 || /\s|\.\.|^[-/]|[~^:?*[\\]/.test(clean)) throw Object.assign(new Error("Not a valid branch name"), { status: 400 });
+  const repo = db.prepare("SELECT r.id, c.platform FROM repos r JOIN connections c ON c.id = r.connection_id WHERE r.id = ?").get(repoId);
+  if (!repo) throw Object.assign(new Error("No such repo"), { status: 404 });
+  if (repo.platform === "local") throw Object.assign(new Error("A local folder tracks whichever branch is checked out"), { status: 400 });
+  const existing = db.prepare("SELECT id FROM branches WHERE repo_id = ? AND name = ?").get(repoId, clean);
+  if (existing) return { id: existing.id, created: false };
+  return { id: Number(db.prepare("INSERT INTO branches (repo_id, name) VALUES (?, ?)").run(repoId, clean).lastInsertRowid), created: true };
+}
+
+export function removeBranch(db, repoId, branchId) {
+  const count = db.prepare("SELECT COUNT(*) AS n FROM branches WHERE repo_id = ?").get(repoId).n;
+  if (count <= 1) throw Object.assign(new Error("A repo needs at least one tracked branch; remove the repo instead"), { status: 400 });
+  const removed = db.prepare("DELETE FROM branches WHERE id = ? AND repo_id = ?").run(branchId, repoId).changes > 0;
+  pruneBlobs(db);
+  return removed;
+}
+
+// ---------- job runner
+
+/** Runs the oldest due job (installation backfills first). Returns its result, or null when nothing is due. */
+export async function runNextJob(ctx) {
+  const { db } = ctx;
+  const cjob = db.prepare("SELECT * FROM connection_jobs WHERE state = 'queued' ORDER BY id LIMIT 1").get();
+  if (cjob) {
+    db.prepare("UPDATE connection_jobs SET state = 'running' WHERE id = ?").run(cjob.id);
+    try {
+      const result = await backfill(ctx, cjob.connection_id);
+      db.prepare("UPDATE connection_jobs SET state = 'done', finished_at = ? WHERE id = ?").run(nowIso(), cjob.id);
+      return { connectionJob: cjob.id, ...result };
+    } catch (err) {
+      db.prepare("UPDATE connection_jobs SET state = 'failed', error = ?, finished_at = ? WHERE id = ?").run(String(err.message), nowIso(), cjob.id);
+      ctx.log?.(`Backfill ${cjob.connection_id} failed: ${err.message}`);
+      return { connectionJob: cjob.id, error: err.message };
+    }
+  }
+
+  const job = db.prepare("SELECT * FROM sync_jobs WHERE state = 'queued' AND (run_after IS NULL OR run_after <= ?) ORDER BY id LIMIT 1").get(new Date().toISOString());
   if (!job) return null;
-  db.prepare("UPDATE sync_jobs SET state = 'running' WHERE id = ?").run(job.id);
+  db.prepare("UPDATE sync_jobs SET state = 'running', attempts = attempts + 1 WHERE id = ?").run(job.id);
   try {
-    const result = syncBranch(db, job.branch_id, { force: job.reason === "resync" });
+    const result = await syncBranch(ctx, job.branch_id, { force: job.reason === "resync" });
     db.prepare("UPDATE sync_jobs SET state = 'done', finished_at = ? WHERE id = ?").run(nowIso(), job.id);
     return { job: job.id, ...result };
   } catch (err) {
+    if (err.retryAfter != null && job.attempts < 5) {
+      // Rate limited: put it back until GitHub says to retry.
+      db.prepare("UPDATE sync_jobs SET state = 'queued', run_after = ? WHERE id = ?").run(new Date(Date.now() + err.retryAfter + 1000).toISOString(), job.id);
+      return { job: job.id, deferred: true, error: err.message };
+    }
     db.prepare("UPDATE sync_jobs SET state = 'failed', error = ?, finished_at = ? WHERE id = ?").run(String(err.message), nowIso(), job.id);
-    db.prepare("UPDATE branches SET sync_error = ?, last_synced_at = ? WHERE id = ?").run(String(err.message), nowIso(), job.branch_id);
+    if (db.prepare("SELECT 1 FROM branches WHERE id = ?").get(job.branch_id)) {
+      db.prepare("UPDATE branches SET sync_error = ?, last_synced_at = ? WHERE id = ?").run(String(err.message), nowIso(), job.branch_id);
+    }
     return { job: job.id, error: err.message };
   }
 }
 
-/** Drains the queue. */
-export function runAllJobs(db) {
+/** Runs every due job, including the ones a backfill queues. */
+export async function runAllJobs(ctx) {
   const results = [];
-  for (let r = runNextJob(db); r; r = runNextJob(db)) results.push(r);
-  db.prepare("DELETE FROM sync_jobs WHERE state IN ('done','failed') AND finished_at < ?")
-    .run(new Date(Date.now() - 7 * 864e5).toISOString());
+  for (let r = await runNextJob(ctx); r; r = await runNextJob(ctx)) results.push(r);
+  const week = new Date(Date.now() - 7 * 864e5).toISOString();
+  ctx.db.prepare("DELETE FROM sync_jobs WHERE state IN ('done','failed') AND finished_at < ?").run(week);
+  ctx.db.prepare("DELETE FROM connection_jobs WHERE state IN ('done','failed') AND finished_at < ?").run(week);
   return results;
 }
 
+// ---------- reading one branch
+
 /**
- * Reads and stores one branch. Skips the write when the content hash is unchanged
- * unless `force`.
+ * Reads and stores one branch. Skips the write when nothing under aidlc/ changed, unless `force`.
  */
-export function syncBranch(db, branchId, { force = false } = {}) {
+export async function syncBranch(ctx, branchId, { force = false } = {}) {
+  const { db } = ctx;
   const branch = db.prepare("SELECT * FROM branches WHERE id = ?").get(branchId);
   if (!branch) throw new Error(`No branch ${branchId}`);
-  const repo = db.prepare("SELECT r.*, c.platform FROM repos r JOIN connections c ON c.id = r.connection_id WHERE r.id = ?").get(branch.repo_id);
-  if (repo.platform !== "local") throw new Error(`${repo.platform} repos are synced from milestone 3`);
+  const repo = db.prepare("SELECT r.*, c.platform, c.external_id FROM repos r JOIN connections c ON c.id = r.connection_id WHERE r.id = ?").get(branch.repo_id);
+  if (repo.platform === "github") return syncGithubBranch(ctx, repo, branch, { force: force || Boolean(branch.sync_error) });
+  if (repo.platform !== "local") throw new Error(`${repo.platform} repos are not supported yet`);
   if (!existsSync(repo.local_path)) throw new Error(`Folder no longer exists: ${repo.local_path}`);
 
   const { files, skipped } = readLocalRepo(repo.local_path);
@@ -151,6 +265,36 @@ export function syncBranch(db, branchId, { force = false } = {}) {
       .run(git.branch ?? branch.name, git.sha, hash, at, branchId);
   });
   return { changed: true, intents: snapshot.intents.length, skipped };
+}
+
+async function syncGithubBranch(ctx, repo, branch, { force }) {
+  const { db } = ctx;
+  const client = ctx.github();
+  if (!client) throw new Error("GitHub is not set up");
+  const getBlob = (sha) => db.prepare("SELECT content FROM blobs WHERE sha = ?").get(sha)?.content;
+  const read = await readGithubBranch(client, {
+    installationId: repo.external_id, fullName: repo.full_name, branch: branch.name, lastTreeKey: branch.last_tree_sha, force, getBlob,
+  });
+  const at = nowIso();
+  if (read.unchanged) {
+    db.prepare("UPDATE branches SET last_synced_at = ?, last_commit_sha = ? WHERE id = ?").run(at, read.commitSha, branch.id);
+    return { changed: false, intents: null, skipped: [] };
+  }
+  const files = new Map(read.entries.map((e) => [e.path, e.content]));
+  const snapshot = parseRepo(files);
+  tx(db, () => {
+    const putBlob = db.prepare("INSERT OR IGNORE INTO blobs (sha, content) VALUES (?, ?)");
+    for (const e of read.entries) if (e.fetched) putBlob.run(e.sha, e.content);
+    db.prepare("DELETE FROM files WHERE branch_id = ?").run(branch.id);
+    const putFile = db.prepare("INSERT INTO files (branch_id, path, sha) VALUES (?, ?, ?)");
+    for (const e of read.entries) putFile.run(branch.id, e.path, e.sha);
+    pruneBlobs(db);
+    writeSnapshot(db, branch.id, snapshot, at);
+    db.prepare("UPDATE repos SET aidlc_version = ? WHERE id = ?").run(snapshot.aidlcVersion, repo.id);
+    db.prepare("UPDATE branches SET last_commit_sha = ?, last_tree_sha = ?, last_synced_at = ?, sync_error = NULL WHERE id = ?")
+      .run(read.commitSha, read.treeKey, at, branch.id);
+  });
+  return { changed: true, intents: snapshot.intents.length, skipped: read.skipped, fetched: read.entries.filter((e) => e.fetched).length };
 }
 
 const qkey = (q) => `${q.file}#${q.kind === "summary" ? "summary" : q.number != null ? `Q${q.number}` : `L${q.line}`}`;

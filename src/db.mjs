@@ -133,10 +133,83 @@ CREATE INDEX IF NOT EXISTS events_intent ON events (intent_id, timestamp);
 CREATE INDEX IF NOT EXISTS jobs_state ON sync_jobs (state, id);
 `;
 
+// Each entry upgrades the database by one version (PRAGMA user_version).
+const MIGRATIONS = [
+  // 1 -> 2: GitHub (milestone 3)
+  `
+  ALTER TABLE connections ADD COLUMN external_id TEXT;
+  CREATE UNIQUE INDEX connections_external ON connections (platform, external_id) WHERE external_id IS NOT NULL;
+  ALTER TABLE sync_jobs ADD COLUMN run_after TEXT;
+  ALTER TABLE sync_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+
+  CREATE TABLE github_app (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    app_id TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    name TEXT NOT NULL,
+    owner TEXT,
+    html_url TEXT,
+    client_id TEXT NOT NULL,
+    client_secret_enc TEXT NOT NULL,
+    webhook_secret_enc TEXT,
+    pem_enc TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  );
+
+  CREATE TABLE connection_jobs (
+    id INTEGER PRIMARY KEY,
+    connection_id INTEGER NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+    reason TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued','running','done','failed')),
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    finished_at TEXT
+  );
+
+  CREATE TABLE blobs (sha TEXT PRIMARY KEY, content TEXT NOT NULL);
+  CREATE TABLE files (
+    branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    sha TEXT NOT NULL,
+    PRIMARY KEY (branch_id, path)
+  );
+  CREATE TABLE http_cache (url TEXT PRIMARY KEY, etag TEXT NOT NULL, body TEXT NOT NULL, stored_at TEXT NOT NULL);
+
+  CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    platform TEXT NOT NULL,
+    platform_user_id TEXT NOT NULL,
+    login TEXT NOT NULL,
+    name TEXT,
+    avatar_url TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    UNIQUE (platform, platform_user_id)
+  );
+  CREATE TABLE sessions (
+    id_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_enc TEXT NOT NULL,
+    repo_ids_json TEXT NOT NULL DEFAULT '[]',
+    checked_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+  );
+  CREATE TABLE oauth_states (state TEXT PRIMARY KEY, purpose TEXT NOT NULL, data TEXT, created_at INTEGER NOT NULL);
+  `,
+];
+
 export function openDb(path) {
   if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
   db.exec(SCHEMA);
+  let version = db.prepare("PRAGMA user_version").get().user_version || 1;
+  while (version - 1 < MIGRATIONS.length) {
+    tx(db, () => {
+      db.exec(MIGRATIONS[version - 1]);
+      db.exec(`PRAGMA user_version = ${version + 1}`);
+    });
+    version += 1;
+  }
   if (!db.prepare("SELECT 1 FROM workspaces LIMIT 1").get()) db.prepare("INSERT INTO workspaces (name) VALUES (?)").run("Default");
   return db;
 }

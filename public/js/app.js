@@ -12,9 +12,38 @@ const REFRESH_MS = 30_000;
 const api = async (path, opts = {}) => {
   const res = await fetch(path, { ...opts, headers: { ...(opts.body ? { "Content-Type": "application/json" } : {}), ...opts.headers } });
   const body = await res.json().catch(() => ({}));
+  if (res.status === 401 && body.signIn) {
+    if (!location.hash.startsWith("#/signin")) location.hash = "#/signin";
+    throw Object.assign(new Error("Sign in to continue"), { status: 401, quiet: true });
+  }
   if (!res.ok) throw Object.assign(new Error(body.error || `Request failed (${res.status})`), { status: res.status });
   return body;
 };
+
+let me = null;
+async function loadMe() {
+  me = await api("/api/me");
+  const box = document.getElementById("account");
+  box.replaceChildren();
+  if (me.signedIn) {
+    box.append(
+      el("span", { class: "who-am-i" }, me.user.login),
+      el("button", { type: "button", class: "btn link small", onclick: async () => {
+        await api("/api/auth/signout", { method: "POST", body: "{}" });
+        await loadMe();
+        location.hash = "#/signin";
+      } }, "Sign out"));
+  }
+  return me;
+}
+
+// Opens a file on GitHub when the repo is on GitHub; otherwise offers to copy its path.
+function fileLink(file, line, url) {
+  return el("div", { class: "path" },
+    el("code", {}, `${file}${line ? `:${line}` : ""}`),
+    url ? el("a", { class: "btn link small", href: url, target: "_blank", rel: "noopener noreferrer" }, "Open on GitHub")
+      : el("button", { type: "button", class: "btn link small", onclick: () => copy(file) }, "Copy path"));
+}
 const phaseKey = (p) => (p ?? "").toLowerCase();
 const stageName = (s) => (s ? s.replace(/-/g, " ").replace(/^\w/, (c) => c.toUpperCase()) : "Unknown stage");
 const sentence = (s) => (s ? s.charAt(0) + s.slice(1).toLowerCase() : "");
@@ -158,9 +187,7 @@ async function inboxView({ params }) {
           it.type === "question" || it.type === "summary" ? el("span", {}, stageName(it.stage)) : el("span", {}, sentence(it.phase)),
           it.unit ? el("span", {}, `Unit ${it.unit}`) : "",
           repos.length > 1 ? el("span", {}, it.repo.name) : ""),
-        el("div", { class: "path" },
-          el("code", {}, `${it.file}${it.line ? `:${it.line}` : ""}`),
-          el("button", { type: "button", class: "btn link small", onclick: () => copy(it.file) }, "Copy path")));
+        fileLink(it.file, it.line, it.url));
     })),
   );
 }
@@ -253,7 +280,8 @@ function questionItem(q) {
     q.prompt ? el("p", { class: "prompt" }, ...rich(q.prompt)) : "",
     q.options.length ? el("ol", {}, ...q.options.map((o) => el("li", {}, o.key ? el("span", { class: "key" }, o.key) : "", ...rich(o.text)))) : "",
     q.open
-      ? el("p", { class: "muted small" }, `${stageName(q.stage)}; open ${q.openSince ? `for ${age(q.openSince)}` : "since the first sync"}; `, el("code", {}, `${q.file}:${q.line}`))
+      ? el("div", {}, el("p", { class: "muted small" }, `${stageName(q.stage)}; open ${q.openSince ? `for ${age(q.openSince)}` : "since the first sync"}`),
+        fileLink(q.file, q.line, q.url))
       : el("p", { class: "answer" }, el("strong", {}, "Answer: "), ...rich(q.answer), q.answeredAt ? el("span", { class: "muted small" }, ` (${fullDate(q.answeredAt)})`) : ""));
 }
 
@@ -284,7 +312,7 @@ async function intentView({ parts }) {
     el("a", { class: "back", href: "#/work" }, "All work"),
     el("h1", {}, i.description ?? i.key),
     el("dl", { class: "meta" },
-      el("div", {}, el("dt", {}, "Repo"), el("dd", {}, i.repo.name)),
+      el("div", {}, el("dt", {}, "Repo"), el("dd", {}, i.repo.url ? el("a", { href: i.repo.url, target: "_blank", rel: "noopener noreferrer" }, i.repo.name) : i.repo.name)),
       el("div", {}, el("dt", {}, "Branch"), el("dd", {}, i.branch)),
       el("div", {}, el("dt", {}, "Folder"), el("dd", { class: "mono" }, i.key)),
       el("div", {}, el("dt", {}, "Scope"), el("dd", {}, i.scope ?? "Unknown")),
@@ -317,64 +345,149 @@ async function intentView({ parts }) {
   );
 }
 
+// ---------- sign-in
+
+function signinView({ params }) {
+  setNav("");
+  const errors = {
+    state: "That sign-in link had expired. Try again.",
+    denied: "GitHub sign-in was cancelled.",
+    failed: "GitHub did not complete the sign-in. Try again.",
+  };
+  if (me?.signedIn) { location.hash = "#/"; return; }
+  main.replaceChildren(
+    el("h1", {}, "Sign in"),
+    el("p", { class: "lead" }, "The tracker shows the repos your GitHub account can read through its GitHub App."),
+    params.get("error") ? el("p", { class: "form-error", role: "alert" }, errors[params.get("error")] ?? "Sign-in failed.") : "",
+    el("a", { class: "btn primary", href: "/auth/github/login" }, "Sign in with GitHub"),
+  );
+}
+
 // ---------- connections
 
-async function connectionsView() {
+function githubSection() {
+  const gh = me.github;
+  if (gh.configured) {
+    const check = el("button", { type: "button", class: "btn", onclick: async () => {
+      check.disabled = true; check.textContent = "Checking";
+      try { await api("/api/github/reconcile", { method: "POST", body: "{}" }); toast("GitHub checked"); render(); }
+      catch (err) { toast(err.message); check.disabled = false; check.textContent = "Check GitHub now"; }
+    } }, "Check GitHub now");
+    return el("section", { class: "gh" },
+      el("h2", {}, "GitHub"),
+      el("p", {}, "Connected through the GitHub App ", el("a", { href: gh.appUrl, target: "_blank", rel: "noopener noreferrer" }, gh.name),
+        gh.owner ? ` owned by ${gh.owner}.` : "."),
+      el("p", { class: "muted small" }, "Tracked branches are checked every 30 seconds. A check with nothing new does not count against GitHub's rate limit."),
+      el("div", { class: "row-actions" },
+        el("a", { class: "btn primary", href: gh.installUrl, target: "_blank", rel: "noopener noreferrer" }, "Choose repos on GitHub"),
+        check));
+  }
+  if (!gh.canSetUp) {
+    return el("section", { class: "gh" }, el("h2", {}, "GitHub"),
+      el("p", { class: "muted" }, "GitHub is not set up. Set it up from the computer running the tracker."));
+  }
+  const org = el("input", { type: "text", name: "org", placeholder: "Leave empty for your own account", autocomplete: "off", spellcheck: "false" });
+  const errorP = el("p", { class: "form-error", role: "alert", hidden: true });
+  const btn = el("button", { type: "submit", class: "btn primary" }, "Set up GitHub");
+  const form = el("form", { class: "add-form", onsubmit: async (e) => {
+    e.preventDefault();
+    errorP.hidden = true; btn.disabled = true;
+    try {
+      const { action, manifest } = await api("/api/github/manifest", { method: "POST", body: JSON.stringify({ org: org.value }) });
+      // GitHub's manifest flow: a form post to GitHub carrying the app definition.
+      const post = el("form", { method: "post", action, hidden: true }, el("input", { type: "hidden", name: "manifest" }));
+      post.querySelector("input").value = JSON.stringify(manifest);
+      document.body.append(post);
+      post.submit();
+    } catch (err) { errorP.textContent = err.message; errorP.hidden = false; btn.disabled = false; }
+  } }, el("label", { class: "field" }, "GitHub organisation that owns the repos (optional)", org), btn);
+  return el("section", { class: "gh" },
+    el("h2", {}, "GitHub"),
+    el("p", {}, "Setting up creates a private GitHub App that can only read repo contents. GitHub shows you the app before creating it; then you choose which repos it may read."),
+    gh.webhooks ? "" : el("p", { class: "muted small" }, "This tracker runs on this computer, so GitHub cannot send it webhooks. It checks tracked branches every 30 seconds instead."),
+    form, errorP);
+}
+
+async function connectionsView({ params }) {
   setNav("connections");
-  const [repos, health] = await Promise.all([api("/api/repos"), api("/api/health")]);
+  await loadMe();
+  const repos = await api("/api/repos");
+  const local = repos.filter((r) => r.platform === "local");
+  const remote = repos.filter((r) => r.platform !== "local");
+
   const errorP = el("p", { class: "form-error", role: "alert", hidden: true });
   const input = el("input", { type: "text", name: "path", placeholder: "/Users/you/code/my-repo", autocomplete: "off", required: true, spellcheck: "false" });
   const addBtn = el("button", { type: "submit", class: "btn primary" }, "Add folder");
-
   const form = el("form", { class: "add-form", onsubmit: async (e) => {
     e.preventDefault();
-    errorP.hidden = true;
-    addBtn.disabled = true;
-    addBtn.textContent = "Reading";
+    errorP.hidden = true; addBtn.disabled = true; addBtn.textContent = "Reading";
     try {
       const repo = await api("/api/repos", { method: "POST", body: JSON.stringify({ path: input.value }) });
       toast(`${repo.name}: ${plural(repo.intents, "piece")} of work found`);
       render();
     } catch (err) {
-      errorP.textContent = err.message;
-      errorP.hidden = false;
-      addBtn.disabled = false;
-      addBtn.textContent = "Add folder";
+      errorP.textContent = err.message; errorP.hidden = false; addBtn.disabled = false; addBtn.textContent = "Add folder";
     }
   } }, el("label", { class: "field" }, "Folder of a repo checkout on this computer", input), addBtn);
 
   const resync = async (r, btn) => {
-    btn.disabled = true;
-    btn.textContent = "Reading";
+    btn.disabled = true; btn.textContent = "Reading";
     try { await api(`/api/repos/${r.id}/resync`, { method: "POST", body: "{}" }); toast(`${r.name} read again`); render(); }
     catch (err) { toast(err.message); btn.disabled = false; btn.textContent = "Read again"; }
   };
   const remove = async (r) => {
-    if (!confirm(`Stop tracking ${r.name}? Its questions and history are removed from the tracker. The repo itself is not touched.`)) return;
+    if (!confirm(`Stop tracking ${r.name}? Its questions and history are removed from the tracker. The folder itself is not touched.`)) return;
     try { await api(`/api/repos/${r.id}`, { method: "DELETE" }); toast(`${r.name} removed`); render(); }
     catch (err) { toast(err.message); }
   };
+  const removeBranch = async (r, b) => {
+    try { await api(`/api/repos/${r.id}/branches/${b.id}`, { method: "DELETE" }); toast(`Stopped tracking ${b.name}`); render(); }
+    catch (err) { toast(err.message); }
+  };
+
+  const branchCell = (r) => {
+    const list = el("ul", { class: "branches" }, ...r.branches.map((b) => el("li", {},
+      el("span", { class: "mono small" }, b.name),
+      el("span", { class: "muted small" }, ` ${plural(b.intents, "piece")} of work, `, b.lastSyncedAt ? timeEl(b.lastSyncedAt, `read ${age(b.lastSyncedAt)} ago`) : "not read yet"),
+      b.syncError ? el("div", { class: "status-err small" }, b.syncError) : "",
+      r.platform !== "local" && r.branches.length > 1
+        ? el("button", { type: "button", class: "btn link small", "aria-label": `Stop tracking ${b.name}`, onclick: () => removeBranch(r, b) }, "Stop tracking") : "")));
+    if (r.platform === "local") return list;
+    const name = el("input", { type: "text", name: "branch", placeholder: "Branch name", autocomplete: "off", spellcheck: "false", "aria-label": `Add a branch to track in ${r.name}` });
+    const add = el("form", { class: "branch-add", onsubmit: async (e) => {
+      e.preventDefault();
+      try { await api(`/api/repos/${r.id}/branches`, { method: "POST", body: JSON.stringify({ name: name.value }) }); toast(`Tracking ${name.value}`); render(); }
+      catch (err) { toast(err.message); }
+    } }, name, el("button", { type: "submit", class: "btn small" }, "Track branch"));
+    return el("div", {}, list, add);
+  };
+
+  const table = (rows) => el("table", { class: "table" },
+    el("thead", {}, el("tr", {}, ...["Repo", "Branches", "AI-DLC", ""].map((h) => el("th", { scope: "col" }, h)))),
+    el("tbody", {}, ...rows.map((r) => {
+      const btn = el("button", { type: "button", class: "btn", onclick: () => resync(r, btn) }, "Read again");
+      return el("tr", {},
+        el("td", { class: "work-name" },
+          r.webUrl ? el("a", { href: r.webUrl, target: "_blank", rel: "noopener noreferrer" }, r.name) : el("strong", {}, r.name),
+          el("span", { class: "key mono muted small" }, r.path ?? (r.account ? `via ${r.account}` : "")),
+          r.openQuestions + r.waiting ? el("span", { class: "muted small" }, `${r.openQuestions + r.waiting} waiting on a person`) : ""),
+        el("td", { "data-label": "Branches" }, branchCell(r)),
+        el("td", { "data-label": "AI-DLC" }, r.aidlcVersion ?? "Not pinned"),
+        el("td", {}, el("div", { class: "actions" }, btn,
+          r.platform === "local" ? el("button", { type: "button", class: "btn danger", onclick: () => remove(r) }, "Remove") : "")));
+    })));
 
   main.replaceChildren(
     el("h1", {}, "Connections"),
     el("p", { class: "lead" }, "Repos the tracker reads. It only reads the AI-DLC records under ", el("code", {}, "aidlc/"), " and never changes anything in a repo."),
-    health.allowLocal ? form : el("p", { class: "muted" }, "Adding local folders is turned off on this server."),
+    params.get("error") === "setup" ? el("p", { class: "form-error", role: "alert" }, "GitHub setup did not finish. Start it again.") : "",
+    githubSection(),
+    remote.length ? table(remote) : me.github.configured ? el("p", { class: "muted" }, "No GitHub repos yet. Choose repos on GitHub, then check GitHub.") : "",
+    el("h2", {}, "Folders on this computer"),
+    me.allowLocal ? form : el("p", { class: "muted" }, "Adding local folders is turned off on this server."),
     errorP,
-    el("p", { class: "muted small" }, `Local folders are read again every 30 seconds. GitHub and GitLab connections are not available yet.`),
-    el("h2", {}, repos.length ? plural(repos.length, "repo") : "No repos yet"),
-    repos.length ? el("table", { class: "table" },
-      el("thead", {}, el("tr", {}, ...["Repo", "Branch", "Work found", "AI-DLC", "Last read", ""].map((h) => el("th", { scope: "col" }, h)))),
-      el("tbody", {}, ...repos.map((r) => {
-        const btn = el("button", { type: "button", class: "btn", onclick: () => resync(r, btn) }, "Read again");
-        return el("tr", {},
-          el("td", { class: "work-name" }, el("strong", {}, r.name), el("span", { class: "key mono muted small" }, r.path ?? r.webUrl ?? "")),
-          el("td", { "data-label": "Branch" }, r.branch),
-          el("td", { "data-label": "Work found" }, plural(r.intents, "piece"), r.openQuestions + r.waiting ? el("div", { class: "muted small" }, `${r.openQuestions + r.waiting} waiting`) : ""),
-          el("td", { "data-label": "AI-DLC" }, r.aidlcVersion ?? "Not pinned"),
-          el("td", { "data-label": "Last read" }, r.lastSyncedAt ? timeEl(r.lastSyncedAt) : "Not yet",
-            r.syncError ? el("div", { class: "status-err small" }, r.syncError) : el("div", { class: "status-ok small" }, "OK")),
-          el("td", {}, el("div", { class: "actions" }, btn, el("button", { type: "button", class: "btn danger", onclick: () => remove(r) }, "Remove"))));
-      }))) : el("p", { class: "muted" }, "Add a folder above to start."),
+    me.allowLocal ? el("p", { class: "muted small" }, "Local folders are read again every 30 seconds.") : "",
+    local.length ? table(local) : el("p", { class: "muted" }, "No folders added."),
   );
 }
 
@@ -385,14 +498,17 @@ async function render() {
   const r = route();
   const ticket = ++rendering;
   try {
+    if (!me) await loadMe();
+    if (r.parts[0] === "signin") return signinView(r);
+    if (me.authRequired && !me.signedIn) { location.hash = "#/signin"; return; }
     if (r.parts[0] === "work" && r.parts[1]) await intentView(r);
     else if (r.parts[0] === "work") await workView(r);
     else if (r.parts[0] === "connections") await connectionsView(r);
     else await inboxView(r);
   } catch (err) {
-    if (ticket === rendering) errorView(err);
+    if (ticket === rendering && !err.quiet) errorView(err);
   }
-  updateCount();
+  if (!me?.authRequired || me?.signedIn) updateCount();
 }
 
 let lastHash = location.hash;

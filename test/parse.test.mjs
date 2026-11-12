@@ -197,7 +197,7 @@ test("sample repo: five intents across two spaces, with the right blockers and q
   const todo = by["261010-todo-bugfix"];
   assert.equal(todo.createdOn, "2026-10-10");
   assert.equal(todo.descriptionSource, "project-description.json");
-  assert.equal(todo.openQuestionCount, 3);
+  assert.equal(todo.openQuestionCount, 4); // 3 questions + the unconfirmed summary
   assert.ok(todo.questions.filter((q) => q.open).every((q) => q.openSince === "2025-07-15T10:25:00Z"));
   assert.deepEqual(todo.approvals, [{ stage: "reverse-engineering", unit: null, gitName: "Priya Shah", at: "2025-07-15T10:20:00Z" }]);
   assert.equal(todo.notes.length, 1);
@@ -247,7 +247,7 @@ test("CLI: inbox, status and JSON output run", () => {
   const cli = new URL("../bin/aidlc-tracker.mjs", import.meta.url).pathname;
   const run = (...a) => execFileSync(process.execPath, [cli, ...a], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   assert.match(run("inbox", SAMPLE), /7 items waiting\./);
-  assert.match(run("status", SAMPLE), /1 of 6 stages done; 3 open questions/);
+  assert.match(run("status", SAMPLE), /1 of 6 stages done; 4 open questions/);
   assert.equal(JSON.parse(run("inbox", SAMPLE, "--json")).length, 7);
   assert.equal(JSON.parse(run("snapshot", SAMPLE)).intents.length, 5);
   assert.throws(() => run("nonsense"), (e) => e.status === 2);

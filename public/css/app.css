@@ -226,6 +226,18 @@ details > summary:hover { color: var(--ink); }
 .status-err { color: var(--attn); }
 .actions { display: flex; gap: 8px; justify-content: flex-end; }
 
+.account { display: flex; gap: 12px; align-items: baseline; font-size: 14px; }
+.who-am-i { color: var(--ink-2); }
+.gh { margin-bottom: 8px; }
+.gh p { max-width: var(--prose); }
+.row-actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0 20px; }
+a.btn { display: inline-flex; align-items: center; text-decoration: none; }
+.btn.small { height: 30px; font-size: 13px; padding: 0 10px; }
+.branches { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.branches li { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.branch-add { display: flex; gap: 8px; margin-top: 8px; }
+.branch-add input { height: 30px; padding: 0 8px; width: 160px; background: var(--panel); border: 1px solid var(--line-2); border-radius: 6px; font-size: 13px; }
+
 .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 10px 16px; border-radius: 8px; font-size: 14px; z-index: 20; }
 
 @media (max-width: 900px) {
@@ -237,6 +249,7 @@ details > summary:hover { color: var(--ink); }
 @media (max-width: 720px) {
   .topbar { padding: 0 16px; gap: 12px; }
   .wordmark span { display: none; }
+  .who-am-i { display: none; }
   main { padding: 24px 16px 72px; }
   h1 { font-size: 32px; }
   .table thead { display: none; }

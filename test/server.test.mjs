@@ -4,7 +4,7 @@ import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApp } from "../src/app.mjs";
-import { enqueueAll, runAllJobs } from "../src/sync.mjs";
+import { enqueueAll } from "../src/sync.mjs";
 
 const SAMPLE = new URL("../fixtures/repos/acme-shop", import.meta.url).pathname;
 const TODO_Q = "aidlc/spaces/default/intents/261010-todo-bugfix/inception/requirements-analysis/requirements-analysis-questions.md";
@@ -12,7 +12,8 @@ const TODO_Q = "aidlc/spaces/default/intents/261010-todo-bugfix/inception/requir
 let dir, repoPath, dbPath, app, base;
 
 async function start(opts = {}) {
-  app = createApp({ dbPath, pollSeconds: 0, ...opts });
+  app = createApp({ dbPath, pollSeconds: 0, githubPollSeconds: 0, ...opts });
+  await app.ready;
   await new Promise((r) => app.server.listen(0, "127.0.0.1", r));
   base = `http://127.0.0.1:${app.server.address().port}`;
 }
@@ -50,8 +51,9 @@ test("health reports the repo and its work", async () => {
 test("repos list the local folder with counts", async () => {
   const { body } = await get("/api/repos");
   assert.equal(body.length, 1);
-  assert.deepEqual([body[0].name, body[0].platform, body[0].intents, body[0].openQuestions, body[0].waiting, body[0].aidlcVersion, body[0].syncError],
-    ["acme-shop", "local", 5, 4, 2, "2.11.3", null]);
+  assert.deepEqual([body[0].name, body[0].platform, body[0].intents, body[0].openQuestions, body[0].waiting, body[0].aidlcVersion],
+    ["acme-shop", "local", 5, 5, 2, "2.11.3"]);
+  assert.deepEqual(body[0].branches.map((b) => [b.name, b.syncError, b.intents]), [["working tree", null, 5]]);
 });
 
 test("inbox: everything waiting, oldest first, with filters", async () => {
@@ -122,7 +124,7 @@ test("new and removed work folders are picked up; unchanged reads are skipped", 
   const unchanged = await send("POST", `/api/repos/${repoId}/resync`, "{}");
   assert.equal(unchanged.body.results[0].changed, true, "a manual resync always re-reads");
   enqueueAll(app.db, "poll");
-  assert.deepEqual(runAllJobs(app.db).map((r) => r.changed), [false], "a poll with nothing changed skips the write");
+  assert.deepEqual((await app.kick()).map((r) => r.changed), [false], "a poll with nothing changed skips the write");
 
   const extra = join(repoPath, "aidlc/spaces/default/intents/261112-new-thing");
   mkdirSync(extra, { recursive: true });

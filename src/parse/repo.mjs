@@ -166,7 +166,8 @@ function parseIntent(space, folder, files) {
     progress: progress(stages),
     blockers,
     questions,
-    openQuestionCount: openQuestions.filter((q) => q.kind === "question").length,
+    // Includes an unconfirmed answer summary: it waits on a person like any question.
+    openQuestionCount: openQuestions.length,
     notes,
     approvals,
     events,
